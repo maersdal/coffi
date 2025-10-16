@@ -1591,6 +1591,8 @@
       obj)))
 
 (defn struct-field-offset
+  ;; TODO(Joshua): Implement an inline arity for this function when dealing with
+  ;; a constant type and field to prevent repeated lookups
   "Given a `struct-def`, returns the byte offset of the `field`."
   [struct-def field]
   (let [layout ^MemoryLayout (c-layout struct-def)
