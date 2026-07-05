@@ -23,6 +23,14 @@
   [value]
   (compile-src! (str "int reload_test_value(void) { return " value "; }\n")))
 
+(defn- musl-libc?
+  "Checks whether this system uses musl libc (e.g. Alpine Linux), whose
+  `dlclose` is deliberately a no-op: libraries are never unloaded and native
+  destructors only run at process exit."
+  []
+  (boolean (some #(re-find #"^ld-musl" (.getName ^java.io.File %))
+                 (.listFiles (io/file "/lib")))))
+
 (defn- ensure-unloaded
   [f]
   (try (f)
@@ -83,10 +91,74 @@
     (t/is (= 9 ((ffi/cfn "reload_test_value" [] ::mem/int))))
     (t/is (not (.exists marker)) "destructor must not run while the library is loaded")
     (ffi/unload-library lib-path)
-    (t/is (.exists marker) "unloading must dlclose the library and run its destructor")))
+    (if (musl-libc?)
+      (t/is (not (.exists marker))
+            "musl never unloads libraries, so the destructor must not have run")
+      (t/is (.exists marker)
+            "unloading must dlclose the library and run its destructor"))))
 
 (t/deftest missing-symbol-fails-at-construction
   (compile-lib! 4)
   (ffi/load-library lib-path)
   (t/is (thrown? UnsatisfiedLinkError
                  (ffi/cfn "no_such_symbol_anywhere" [] ::mem/int))))
+
+(t/deftest defcfn-fns-survive-reload
+  (compile-lib! 7)
+  (ffi/load-library lib-path)
+  (ffi/defcfn reload-val "reload_test_value" [] ::mem/int)
+  (t/is (= 7 (reload-val)))
+  (ffi/unload-library lib-path)
+  (compile-lib! 8)
+  (ffi/load-library lib-path)
+  (t/is (= 8 (reload-val)) "the same defcfn'd var calls the recompiled code"))
+
+(def ^:private point-t
+  [::mem/struct [[:x ::mem/float] [:y ::mem/float]]])
+
+(defn- rich-source
+  "C source exercising structs, pointers, strings, and callbacks, with `v`
+  mixed into every result to distinguish library versions."
+  [v]
+  (str "typedef struct { float x; float y; } point;\n"
+       "int reload_test_value(void) { return " v "; }\n"
+       "point reload_make_point(float x, float y) {\n"
+       "  point p; p.x = x + " v "; p.y = y + " v "; return p;\n"
+       "}\n"
+       "float reload_point_sum(point p) { return p.x + p.y + " v "; }\n"
+       "void reload_write_int(int* out) { *out = " v "; }\n"
+       "long long reload_str_len(const char* s) {\n"
+       "  long long n = 0; while (s[n]) n++; return n + " v ";\n"
+       "}\n"
+       "int reload_call_cb(int (*f)(int)) { return f(" v "); }\n"))
+
+(t/deftest structs-pointers-strings-callbacks-survive-reload
+  (compile-src! (rich-source 10))
+  (ffi/load-library lib-path)
+  (let [make-point (ffi/cfn "reload_make_point" [::mem/float ::mem/float] point-t)
+        point-sum (ffi/cfn "reload_point_sum" [point-t] ::mem/float)
+        write-int (ffi/cfn "reload_write_int" [::mem/pointer] ::mem/void)
+        str-len (ffi/cfn "reload_str_len" [::mem/c-string] ::mem/long)
+        call-cb (ffi/cfn "reload_call_cb" [[::ffi/fn [::mem/int] ::mem/int]] ::mem/int)
+        check
+        (fn [v]
+          (t/is (= {:x (float (+ 1 v)) :y (float (+ 2 v))}
+                   (make-point 1 2))
+                "struct returned by value")
+          (t/is (= (float (+ 3 v))
+                   (point-sum {:x 1.0 :y 2.0}))
+                "struct passed by value")
+          (with-open [arena (mem/confined-arena)]
+            (let [out (mem/alloc-instance ::mem/int arena)]
+              (write-int out)
+              (t/is (= v (mem/deserialize-from out ::mem/int))
+                    "write through an out-pointer")))
+          (t/is (= (+ 5 v) (str-len "hello"))
+                "string argument")
+          (t/is (= (* 2 v) (call-cb (fn [x] (* 2 x))))
+                "clojure fn as callback"))]
+    (check 10)
+    (ffi/unload-library lib-path)
+    (compile-src! (rich-source 20))
+    (ffi/load-library lib-path)
+    (check 20)))

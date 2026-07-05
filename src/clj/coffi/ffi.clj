@@ -8,27 +8,88 @@
   (:import
    (clojure.lang
     IDeref IFn IMeta IObj IReference)
-   (coffi.ffi Loader)
+   (java.io File InputStream)
    (java.lang.invoke
     MethodHandle
     MethodHandles
     MethodType)
    (java.lang.foreign
+    Arena
     Linker
     Linker$Option
     FunctionDescriptor
     MemoryLayout
     MemorySegment
-    SegmentAllocator)))
+    SegmentAllocator
+    SymbolLookup)
+   (java.security MessageDigest)
+   (java.util LinkedHashMap)
+   (java.util.concurrent ConcurrentHashMap)
+   (java.util.regex Pattern)))
 
 (set! *warn-on-reflection* true)
 
 ;;; FFI Code loading and function access
+;;
+;; Libraries are loaded with SymbolLookup/libraryLookup, which ties the
+;; lifetime of a library to an arena rather than to a classloader the way
+;; System/load does. This allows libraries to be unloaded and reloaded
+;; without restarting the JVM, and requires no AOT-compiled Java shim to
+;; provide a stable classloader, so no prep step is needed to use coffi as a
+;; git dependency.
 
-(defn load-system-library
-  "Loads the library named `libname` from the system's load path."
-  [libname]
-  (Loader/loadSystemLibrary (name libname)))
+(def ^:private system-lookup
+  "Lookup for symbols in the standard system libraries, e.g. libc."
+  (delay (.or (.defaultLookup (Linker/nativeLinker)) (SymbolLookup/loaderLookup))))
+
+(def ^:private libraries
+  "Registry of loaded libraries.
+
+  Maps a library key (the canonical file path for [[load-library]], the
+  platform library filename for [[load-system-library]]) to a map of
+  `:arena`, `:lookup`, and `:content-hash`. Iteration order is load order,
+  which is also symbol resolution order. All access must hold the lock on
+  this object."
+  (LinkedHashMap.))
+
+(def ^:private symbol-cache
+  "Cache of resolved symbol addresses, so that re-resolving a symbol on every
+  call is just a map lookup. Invalidated whenever a library is loaded or
+  unloaded."
+  (ConcurrentHashMap.))
+
+(defn- hash-file
+  "Computes the SHA-256 digest of the contents of the file at `path`."
+  ^bytes [path]
+  (let [digest (MessageDigest/getInstance "SHA-256")
+        buffer (byte-array 65536)]
+    (with-open [^InputStream in (io/input-stream path)]
+      (loop []
+        (let [read (.read in buffer)]
+          (when-not (neg? read)
+            (.update digest buffer 0 read)
+            (recur)))))
+    (.digest digest)))
+
+(defn- put-library!
+  "Loads the library `target` (a file path or platform library filename) and
+  registers its lookup under `key`, replacing any previous entry. Must be
+  called while holding the [[libraries]] lock."
+  [key ^String target content-hash]
+  (when-some [old (.remove ^LinkedHashMap libraries key)]
+    (.close ^Arena (:arena old))
+    (.clear ^ConcurrentHashMap symbol-cache))
+  (let [arena (Arena/ofShared)]
+    (try
+      (.put ^LinkedHashMap libraries key
+            {:arena arena
+             :lookup (SymbolLookup/libraryLookup target arena)
+             :content-hash content-hash})
+      (.clear ^ConcurrentHashMap symbol-cache)
+      nil
+      (catch RuntimeException e
+        (.close arena)
+        (throw e)))))
 
 (defn load-library
   "Loads the library at `path`.
@@ -47,7 +108,15 @@
   handlers, or TLS destructors are not safely reloadable, and dependent
   libraries keep using the old copy until they are reloaded themselves."
   [path]
-  (Loader/loadLibrary (.getCanonicalPath (io/file path))))
+  (let [filepath (.getCanonicalPath (io/file path))]
+    (locking libraries
+      (let [content-hash (hash-file filepath)
+            existing (.get ^LinkedHashMap libraries filepath)]
+        (when-not (and existing
+                       (MessageDigest/isEqual ^bytes (:content-hash existing)
+                                              content-hash))
+          (put-library! filepath filepath content-hash)))))
+  nil)
 
 (defn unload-library
   "Unloads the library previously loaded from `path`.
@@ -61,12 +130,71 @@
   dependency of another loaded library, or is pinned by TLS destructors); in
   that case a subsequent [[load-library]] can silently return the old code."
   [path]
-  (Loader/unloadLibrary (.getCanonicalPath (io/file path))))
+  (let [filepath (.getCanonicalPath (io/file path))]
+    (locking libraries
+      (when-some [entry (.remove ^LinkedHashMap libraries filepath)]
+        (.close ^Arena (:arena entry))
+        (.clear ^ConcurrentHashMap symbol-cache))))
+  nil)
+
+(defn load-system-library
+  "Loads the library named `libname` from the system's load path.
+
+  `libname` is a bare library name; it is mapped to the platform's filename
+  (e.g. `\"z\"` becomes `libz.so` or `z.dll`) and searched for on
+  `java.library.path` first, then on the operating system's default library
+  search path (`LD_LIBRARY_PATH`, `PATH`, system directories).
+
+  Unlike [[load-library]], a system library is loaded at most once and stays
+  loaded for the lifetime of the JVM; repeated calls are no-ops.
+
+  This loads via the same mechanism as [[load-library]] (`dlopen` and
+  equivalents) rather than `System/loadLibrary`, so JNI libraries which rely
+  on `JNI_OnLoad` or registering natives are not initialized as JNI expects;
+  for those, call `System/loadLibrary` directly."
+  [libname]
+  (let [mapped (System/mapLibraryName (name libname))
+        on-library-path
+        (some (fn [dir]
+                (let [f (io/file ^String dir mapped)]
+                  (when (.isFile f)
+                    (.getCanonicalPath f))))
+              (.split ^String (System/getProperty "java.library.path" "")
+                      (Pattern/quote File/pathSeparator)))]
+    (locking libraries
+      (when-not (.containsKey ^LinkedHashMap libraries mapped)
+        (put-library! mapped (or on-library-path mapped) nil))))
+  nil)
 
 (defn find-symbol
-  "Gets the [[MemorySegment]] of a symbol from the loaded libraries."
+  "Gets the [[MemorySegment]] of a symbol from the loaded libraries.
+
+  Searches the libraries loaded with [[load-library]] and
+  [[load-system-library]] in load order, then the standard system libraries,
+  e.g. libc. Returns nil when the symbol cannot be found. Resolutions are
+  cached until the next library load or unload."
   [sym]
-  (Loader/findSymbol (name sym)))
+  (let [sym-name (name sym)]
+    (or (.get ^ConcurrentHashMap symbol-cache sym-name)
+        (locking libraries
+          (when-some [address
+                      (or (some (fn [entry]
+                                  (.orElse (.find ^SymbolLookup (:lookup entry)
+                                                  sym-name)
+                                           nil))
+                                (.values ^LinkedHashMap libraries))
+                          (.orElse (.find ^SymbolLookup @system-lookup sym-name)
+                                   nil))]
+            (.put ^ConcurrentHashMap symbol-cache sym-name address)
+            address)))))
+
+(defn- require-symbol
+  "Like [[find-symbol]], but throws an [[UnsatisfiedLinkError]] when the
+  symbol cannot be resolved."
+  ^MemorySegment [sym-name]
+  (or (find-symbol sym-name)
+      (throw (UnsatisfiedLinkError.
+              (str "Could not resolve native symbol: " sym-name)))))
 
 (defn- function-descriptor
   "Gets the [[FunctionDescriptor]] for a set of `args` and `ret` types."
@@ -86,10 +214,15 @@
   (.downcallHandle (Linker/nativeLinker) sym function-descriptor
                    (make-array Linker$Option 0)))
 
+(def ^:private ^MethodHandle ifn-invoke-handle
+  "Method handle which invokes an [[IFn]] with a single argument."
+  (.findVirtual (MethodHandles/lookup) IFn "invoke"
+                (MethodType/methodType Object ^Class Object)))
+
 (defn- reloadable-downcall-handle
   "Gets a [[MethodHandle]] which re-resolves `symbol-name` on every call.
 
-  Resolution is a lookup in [[Loader]]'s symbol cache, which is invalidated
+  Resolution is a lookup in the [[symbol-cache]], which is invalidated
   whenever a library is loaded or unloaded, so calls through this handle
   always target the currently loaded copy of the library."
   [symbol-name function-descriptor]
@@ -97,10 +230,9 @@
    (.downcallHandle (Linker/nativeLinker) ^FunctionDescriptor function-descriptor
                     (make-array Linker$Option 0))
    0
-   (MethodHandles/insertArguments
-    (.findStatic (MethodHandles/lookup) Loader "requireSymbol"
-                 (MethodType/methodType MemorySegment String))
-    0 (object-array [symbol-name]))))
+   (-> ifn-invoke-handle
+       (MethodHandles/insertArguments 0 (object-array [require-symbol symbol-name]))
+       (.asType (MethodType/methodType MemorySegment)))))
 
 (def ^:private load-instructions
   "Mapping from primitive types to the instruction used to load them onto the stack."
@@ -266,7 +398,7 @@
         (downcall-handle symbol-or-addr (function-descriptor args ret))
         (let [sym-name (name symbol-or-addr)]
           ;; fail fast at construction time if the symbol doesn't exist
-          (Loader/requireSymbol sym-name)
+          (require-symbol sym-name)
           (reloadable-downcall-handle sym-name (function-descriptor args ret))))
       (downcall-fn args ret)))
 

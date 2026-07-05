@@ -1,0 +1,37 @@
+# Runs the coffi test suite in a Linux container.
+#
+# Default is Alpine (musl libc), the harshest cross-platform target: musl's
+# dlclose is a no-op, so this exercises library loading and reloading under a
+# libc that never unloads. Pass a Debian-based image to test glibc instead.
+#
+#   docker build -f Dockerfile.test -t coffi-test .
+#   docker build -f Dockerfile.test -t coffi-test-glibc \
+#     --build-arg BASE_IMAGE=eclipse-temurin:23-jdk .
+#   docker run --rm coffi-test
+ARG BASE_IMAGE=eclipse-temurin:23-jdk-alpine
+FROM ${BASE_IMAGE}
+
+RUN if command -v apk >/dev/null; then \
+      apk add --no-cache bash curl git clang gcc musl-dev zlib-dev; \
+    else \
+      apt-get update && \
+      apt-get install -y --no-install-recommends curl git clang gcc libc6-dev zlib1g-dev && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN curl -fsSL -o /tmp/clojure-install.sh \
+      https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh \
+ && bash /tmp/clojure-install.sh \
+ && rm /tmp/clojure-install.sh
+
+WORKDIR /coffi
+
+# warm the dependency cache as its own layer
+COPY deps.edn build.clj ./
+RUN clojure -P -X:test && clojure -P -T:build help || true
+
+COPY src src
+COPY resources resources
+COPY test test
+
+CMD ["/bin/sh", "-c", "clojure -T:build compile-test-library && clojure -X:test"]
