@@ -17,12 +17,13 @@
    [clojure.tools.build.api :as b]))
 
 (def lib-coord 'org.suskalo/coffi)
-(def version (format "1.0.%s" (b/git-count-revs nil)))
+(def version
+  (format "1.0.%s" (or (try (b/git-count-revs nil) (catch Exception _ nil))
+                       "dev")))
 
 (def resource-dirs ["resources/"])
 
 (def source-dirs ["src/clj/"])
-(def java-source-dirs ["src/java/"])
 
 (def c-test-dirs ["test/c/"])
 
@@ -44,19 +45,6 @@
   "Checks if a file composed of the given path segments exists."
   [& path-components]
   (.exists ^java.io.File (apply io/file path-components)))
-
-(defn compile-java
-  "Compiles java classes required for interop."
-  [opts]
-  (.mkdirs (io/file class-dir))
-  (let [compilation-result
-        (b/process {:command-args ["javac"
-                                   "src/java/coffi/ffi/Loader.java"
-                                   "-d" class-dir
-                                   "--release" "22"]})]
-    (when-not (zero? (:exit compilation-result))
-      (b/delete {:path class-dir})))
-  opts)
 
 (defn- write-pom
   "Writes a pom file if one does not already exist."
@@ -100,7 +88,6 @@
   This is a thin jar including only the sources."
   [opts]
   (write-pom opts)
-  (compile-java opts)
   (copy-resources opts)
   (when-not (exists? target-dir jar-file)
     (b/copy-dir {:target-dir class-dir

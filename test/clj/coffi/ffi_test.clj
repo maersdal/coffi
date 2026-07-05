@@ -11,6 +11,28 @@
 (t/deftest can-load-symbols
   (t/is (not (nil? (ffi/find-symbol "add_numbers")))))
 
+(t/deftest system-symbols-resolve-without-loading
+  ;; libc/CRT symbols come from the default system lookup, with no library
+  ;; loaded at all
+  (t/is (= 5 ((ffi/cfn "strlen" [::mem/c-string] ::mem/long) "hello"))))
+
+(t/deftest can-load-system-library
+  (if (.startsWith (System/getProperty "os.name") "Windows")
+    (do (ffi/load-system-library "kernel32")
+        ;; repeated loads are no-ops
+        (ffi/load-system-library "kernel32")
+        (t/is (= (.pid (java.lang.ProcessHandle/current))
+                 (Integer/toUnsignedLong
+                  ((ffi/cfn "GetCurrentProcessId" [] ::mem/int))))))
+    ;; on unix-likes a bare library name resolves only when the unversioned
+    ;; .so/.dylib exists (e.g. from a dev package), so skip when absent
+    (let [loaded? (try (ffi/load-system-library "z")
+                       true
+                       (catch RuntimeException _ false))]
+      (if loaded?
+        (t/is (some? (ffi/find-symbol "zlibVersion")))
+        (println "libz not on the system load path; skipping system library test")))))
+
 (t/deftest can-fetch-constant
   (t/is (= 42 (ffi/const "c" ::mem/int)))
   (t/is (= "Test string" (ffi/const "s" ::mem/c-string))))

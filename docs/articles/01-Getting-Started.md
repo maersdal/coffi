@@ -11,12 +11,8 @@ io.github.IGJoshua/coffi {:git/tag "x.y.z" :git/sha "abcdef0"}
 
 See GitHub for the [latest releases](https://github.com/IGJoshua/coffi/releases).
 
-If you use this library as a git dependency, you will need to prepare the
-library.
-
-```sh
-$ clj -X:deps prep
-```
+Coffi is pure Clojure with no compilation step, so it can be used as a git
+dependency directly — no `clj -X:deps prep` is required.
 
 Coffi requires usage of the package `java.lang.foreign`, and most of the
 operations are considered unsafe by the JDK, and are therefore unavailable to
@@ -107,6 +103,45 @@ loaded, an exception is thrown. This can be convenient as any namespace with a
 `load-library` call at the top level cannot be required without the library
 being able to be loaded.
 
+### How Library Loading Works
+All loading goes through the OS loader (`dlopen` on POSIX, `LoadLibrary` on
+Windows) via `java.lang.foreign.SymbolLookup/libraryLookup`, with each
+library's lifetime tied to an arena rather than to a classloader. `find-symbol`
+(and every fn created from a symbol name) resolves in this order:
+
+1. libraries loaded with `load-library`, in load order
+2. libraries loaded with `load-system-library`, in load order
+3. the system default lookup — libc/CRT and libraries the JVM itself links
+
+What works:
+
+- **Calling any exported C function** from a loaded library, including passing
+  and returning structs by value, pointers, strings, and Clojure fns as
+  callbacks.
+- **Calling libc/CRT functions with no library loaded at all** (`strlen`,
+  `malloc`, ...) — they resolve from the system default lookup.
+- **`load-system-library` by bare name** — the name is mangled with
+  `System/mapLibraryName` (`"z"` → `libz.so`/`z.dll`), searched on
+  `java.library.path` first and the OS default search path second. System
+  libraries load once and stay loaded for the JVM's lifetime.
+- **Unloading and reloading** libraries loaded by file path (see below).
+
+What does not work:
+
+- **JNI libraries.** Loading happens via `dlopen`, not `System/loadLibrary`,
+  so `JNI_OnLoad` is never called and JNI natives are not registered. If you
+  need a JNI library, call `System/loadLibrary` yourself — coffi is the
+  replacement for JNI, not a JNI loader.
+- **Symbols from libraries other code loaded with `System/loadLibrary`** are
+  visible to `find-symbol` only on a best-effort basis: the JVM scopes those
+  libraries to the loading class's classloader, which Clojure replaces
+  freely. Load libraries through coffi if you want to call them through
+  coffi.
+- **Bare-name loading of libraries that only ship versioned files.** On many
+  Linux systems `libfoo.so` (as opposed to `libfoo.so.1`) exists only when a
+  dev package is installed; `load-library` with a full path is the reliable
+  alternative.
+
 ### Reloading Libraries
 
 Libraries loaded with `load-library` can be reloaded without restarting the JVM:
@@ -126,6 +161,9 @@ detect or prevent:
   another loaded library can pin the old copy, in which case reloading silently returns the old code.
 - Unloading a library that spawned its own threads or installed signal handlers or window procedures
   crashes the JVM when they next run. Only load-and-call style libraries are safely reloadable.
+- On musl libc (e.g. Alpine Linux) `dlclose` is deliberately a no-op: old copies are never unmapped
+  and their destructors only run at process exit. Reloading still picks up recompiled code (the new
+  copy is a fresh file), but each reload leaks the old mapping.
 
 
 ### Primitive Types

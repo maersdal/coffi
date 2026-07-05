@@ -25,12 +25,8 @@ org.suskalo/coffi {:mvn/version "1.0.615"}
 io.github.IGJoshua/coffi {:git/tag "v1.0.615" :git/sha "7401485"}
 ```
 
-If you use this library as a git dependency, you will need to prepare the
-library.
-
-```sh
-$ clj -X:deps prep
-```
+Coffi is pure Clojure with no compilation step, so it can be used as a git
+dependency directly — no `clj -X:deps prep` is required.
 
 Coffi requires usage of the package `java.lang.foreign`, and most of the
 operations are considered unsafe by the JDK, and are therefore unavailable to
