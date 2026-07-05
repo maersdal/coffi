@@ -33,23 +33,35 @@
 (defn load-library
   "Loads the library at `path`.
 
-  If a library was already loaded from `path` and the file is unchanged,
-  this is a no-op. If the file has changed (e.g. it was recompiled), the old
-  library is unloaded and replaced with the current contents of the file, so
-  this can be called again after recompiling a library to pick up the new
-  code. Symbols and fns created from the old copy are invalidated and must
-  be re-created (e.g. by re-evaluating [[defcfn]] forms)."
+  If a library was already loaded from `path` and its contents are unchanged,
+  this is a no-op. If the contents have changed (e.g. it was recompiled), the
+  old library is unloaded and replaced, so this can be called again after
+  recompiling a library to pick up the new code. Fns created from symbol
+  names (e.g. via [[defcfn]] or [[cfn]]) re-resolve their symbol on each call
+  and keep working across reloads.
+
+  Reloading has caveats which coffi cannot detect or prevent; see the
+  \"Reloading Libraries\" section of the Getting Started article for the
+  failure modes. In short: the fresh copy's static state is reset, pointers
+  obtained from the old copy are dangling, libraries owning threads, signal
+  handlers, or TLS destructors are not safely reloadable, and dependent
+  libraries keep using the old copy until they are reloaded themselves."
   [path]
-  (Loader/loadLibrary (.getAbsolutePath (io/file path))))
+  (Loader/loadLibrary (.getCanonicalPath (io/file path))))
 
 (defn unload-library
   "Unloads the library previously loaded from `path`.
 
   On Windows the library file is locked while loaded, so it must be unloaded
-  before it can be recompiled. Symbols and fns created from the library are
-  invalidated; using them after unloading may crash the JVM."
+  before it can be recompiled. Fns created from the library's symbols throw
+  [[UnsatisfiedLinkError]] while it is unloaded; raw addresses and pointers
+  obtained from it are dangling, and using them may crash the JVM.
+
+  The OS may keep a library mapped despite unloading (e.g. when it is a
+  dependency of another loaded library, or is pinned by TLS destructors); in
+  that case a subsequent [[load-library]] can silently return the old code."
   [path]
-  (Loader/unloadLibrary (.getAbsolutePath (io/file path))))
+  (Loader/unloadLibrary (.getCanonicalPath (io/file path))))
 
 (defn find-symbol
   "Gets the [[MemorySegment]] of a symbol from the loaded libraries."
