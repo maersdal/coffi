@@ -31,9 +31,25 @@
   (Loader/loadSystemLibrary (name libname)))
 
 (defn load-library
-  "Loads the library at `path`."
+  "Loads the library at `path`.
+
+  If a library was already loaded from `path` and the file is unchanged,
+  this is a no-op. If the file has changed (e.g. it was recompiled), the old
+  library is unloaded and replaced with the current contents of the file, so
+  this can be called again after recompiling a library to pick up the new
+  code. Symbols and fns created from the old copy are invalidated and must
+  be re-created (e.g. by re-evaluating [[defcfn]] forms)."
   [path]
   (Loader/loadLibrary (.getAbsolutePath (io/file path))))
+
+(defn unload-library
+  "Unloads the library previously loaded from `path`.
+
+  On Windows the library file is locked while loaded, so it must be unloaded
+  before it can be recompiled. Symbols and fns created from the library are
+  invalidated; using them after unloading may crash the JVM."
+  [path]
+  (Loader/unloadLibrary (.getAbsolutePath (io/file path))))
 
 (defn find-symbol
   "Gets the [[MemorySegment]] of a symbol from the loaded libraries."
@@ -57,6 +73,22 @@
   [sym function-descriptor]
   (.downcallHandle (Linker/nativeLinker) sym function-descriptor
                    (make-array Linker$Option 0)))
+
+(defn- reloadable-downcall-handle
+  "Gets a [[MethodHandle]] which re-resolves `symbol-name` on every call.
+
+  Resolution is a lookup in [[Loader]]'s symbol cache, which is invalidated
+  whenever a library is loaded or unloaded, so calls through this handle
+  always target the currently loaded copy of the library."
+  [symbol-name function-descriptor]
+  (MethodHandles/collectArguments
+   (.downcallHandle (Linker/nativeLinker) ^FunctionDescriptor function-descriptor
+                    (make-array Linker$Option 0))
+   0
+   (MethodHandles/insertArguments
+    (.findStatic (MethodHandles/lookup) Loader "requireSymbol"
+                 (MethodType/methodType MemorySegment String))
+    0 (object-array [symbol-name]))))
 
 (def ^:private load-instructions
   "Mapping from primitive types to the instruction used to load them onto the stack."
@@ -212,11 +244,18 @@
   serialization or deserialization of arguments or the return type.
 
   If the `ret` type is non-primitive, then the returned function will take a
-  first argument of a [[SegmentAllocator]]."
+  first argument of a [[SegmentAllocator]].
+
+  If `symbol-or-addr` is a symbol name rather than an address, the returned
+  function re-resolves the symbol on every call (a cheap cache lookup), so it
+  stays valid when the library is reloaded with [[load-library]]."
   [symbol-or-addr args ret]
-  (-> symbol-or-addr
-      ensure-symbol
-      (downcall-handle (function-descriptor args ret))
+  (-> (if (instance? MemorySegment symbol-or-addr)
+        (downcall-handle symbol-or-addr (function-descriptor args ret))
+        (let [sym-name (name symbol-or-addr)]
+          ;; fail fast at construction time if the symbol doesn't exist
+          (Loader/requireSymbol sym-name)
+          (reloadable-downcall-handle sym-name (function-descriptor args ret))))
       (downcall-fn args ret)))
 
 (defn make-varargs-factory
@@ -458,7 +497,6 @@
   arguments."
   [symbol required-args ret]
   (-> symbol
-      ensure-symbol
       (make-varargs-factory required-args ret)
       (make-serde-varargs-wrapper required-args ret)))
 
@@ -818,7 +856,7 @@
     `(let [~address (find-symbol ~(name (:symbol args)))
            ~(or (-> args :wrapper :native-fn)
                 native-sym)
-           (-> (make-downcall ~address ~(:native-arglist args) ~(:return-type args))
+           (-> (make-downcall ~(name (:symbol args)) ~(:native-arglist args) ~(:return-type args))
                (make-serde-wrapper ~(:native-arglist args) ~(:return-type args)))
            fun# ~(if (:wrapper args)
                    `(fn ~(:name args)
