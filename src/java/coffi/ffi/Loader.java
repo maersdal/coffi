@@ -1,7 +1,13 @@
 package coffi.ffi;
 
-import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.lang.foreign.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -20,7 +26,7 @@ public class Loader {
     static final SymbolLookup systemLookup =
         Linker.nativeLinker().defaultLookup().or(SymbolLookup.loaderLookup());
 
-    record Library(Arena arena, SymbolLookup lookup, long lastModified, long size) {}
+    record Library(Arena arena, SymbolLookup lookup, byte[] contentHash) {}
 
     static final Map<String, Library> libraries = new LinkedHashMap<>();
 
@@ -34,31 +40,44 @@ public class Loader {
     /**
      * Loads a library from a given absolute file path.
      *
-     * If a library was already loaded from this path and the file is
-     * unchanged, this is a no-op. If the file has changed (e.g. it was
-     * recompiled), the old library is unloaded and the new one loaded in its
-     * place; symbols already resolved from the old copy become invalid.
+     * If a library was already loaded from this path and the file's contents
+     * are unchanged, this is a no-op. If the contents have changed (e.g. it
+     * was recompiled), the old library is unloaded and the new one loaded in
+     * its place; symbols already resolved from the old copy become invalid.
      *
      * @param filepath The absolute file path of the library to load
      */
     public static synchronized void loadLibrary(String filepath) {
-        File file = new File(filepath);
-        long lastModified = file.lastModified();
-        long size = file.length();
+        byte[] contentHash = hashFile(filepath);
         Library existing = libraries.get(filepath);
         if (existing != null
-            && existing.lastModified() == lastModified
-            && existing.size() == size) {
+            && MessageDigest.isEqual(existing.contentHash(), contentHash)) {
             return;
         }
         unloadLibrary(filepath);
         Arena arena = Arena.ofShared();
         try {
-            libraries.put(filepath, new Library(arena, SymbolLookup.libraryLookup(filepath, arena), lastModified, size));
+            libraries.put(filepath, new Library(arena, SymbolLookup.libraryLookup(filepath, arena), contentHash));
             symbolCache.clear();
         } catch (RuntimeException e) {
             arena.close();
             throw e;
+        }
+    }
+
+    static byte[] hashFile(String filepath) {
+        try (InputStream in = Files.newInputStream(Path.of(filepath))) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[65536];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+            }
+            return digest.digest();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Could not read library file: " + filepath, e);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
         }
     }
 
