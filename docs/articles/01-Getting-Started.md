@@ -107,6 +107,27 @@ loaded, an exception is thrown. This can be convenient as any namespace with a
 `load-library` call at the top level cannot be required without the library
 being able to be loaded.
 
+### Reloading Libraries
+
+Libraries loaded with `load-library` can be reloaded without restarting the JVM:
+ calling `load-library` again is a no-op while the file's contents are unchanged.
+Fns created from symbol names (`defcfn`, `cfn`, etc) re-resolve their symbol on each call.
+`unload-library` unloads a library explicitly; on Windows this is required before recompiling, 
+because the OS locks the file while it is loaded. 
+Calling a fn whose library is unloaded throws `UnsatisfiedLinkError`.
+
+Reloading is a REPL-development tool with sharp edges that coffi cannot
+detect or prevent:
+
+- Static variables are reset, and any initialization must be redone.
+- Addresses previously returned by the library (strings, structs, function pointers) should point into
+  random memory after a reload; dereferencing them can crash the JVM.
+- Thread-local storage destructors (common in C++ and Rust), `atexit` handlers, or being a dependency of
+  another loaded library can pin the old copy, in which case reloading silently returns the old code.
+- Unloading a library that spawned its own threads or installed signal handlers or window procedures
+  crashes the JVM when they next run. Only load-and-call style libraries are safely reloadable.
+
+
 ### Primitive Types
 Coffi defines a basic set of primitive types:
 
