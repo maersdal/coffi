@@ -97,11 +97,13 @@
       (t/is (.exists marker)
             "unloading must dlclose the library and run its destructor"))))
 
-(t/deftest missing-symbol-fails-at-construction
+(t/deftest missing-symbol-fails-at-call
   (compile-lib! 4)
   (ffi/load-library lib-path)
-  (t/is (thrown? UnsatisfiedLinkError
-                 (ffi/cfn "no_such_symbol_anywhere" [] ::mem/int))))
+  ;; construction succeeds even while the symbol is missing (the library may
+  ;; be loaded later, e.g. in -main of an AOT-compiled program)
+  (let [f (ffi/cfn "no_such_symbol_anywhere" [] ::mem/int)]
+    (t/is (thrown? UnsatisfiedLinkError (f)))))
 
 (t/deftest defcfn-fns-survive-reload
   (compile-lib! 7)

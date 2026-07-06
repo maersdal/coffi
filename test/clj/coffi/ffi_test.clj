@@ -11,6 +11,19 @@
 (t/deftest can-load-symbols
   (t/is (not (nil? (ffi/find-symbol "add_numbers")))))
 
+(t/deftest generates-native-image-metadata
+  ;; constructing a fn with a callback type records upcall + downcall
+  ;; descriptors without anything being called
+  (ffi/cfn "upcall_test" [[::ffi/fn [] ::mem/c-string]] ::mem/c-string)
+  (let [file (ffi/write-native-image-metadata! "target/coffi-metadata-test")
+        content ^String (slurp file)]
+    (t/is (.contains content "\"foreign\""))
+    ;; add_numbers: jint(jint, jint), constructed at ns load
+    (t/is (.contains content "{\"returnType\": \"jint\", \"parameterTypes\": [\"jint\", \"jint\"]}"))
+    ;; the callback type: void*() as an upcall
+    (t/is (.contains content "\"upcalls\""))
+    (t/is (.contains content "{\"returnType\": \"void*\", \"parameterTypes\": []}"))))
+
 (t/deftest system-symbols-resolve-without-loading
   ;; libc/CRT symbols come from the default system lookup, with no library
   ;; loaded at all

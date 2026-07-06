@@ -1,0 +1,24 @@
+# Builds and runs the examples/native-image coffi example as a GraalVM
+# native image (Linux x64).
+#
+#   docker build -f Dockerfile.native -t coffi-native .
+#   docker run --rm coffi-native
+FROM ghcr.io/graalvm/native-image-community:25
+
+RUN microdnf install -y bash curl git gcc && microdnf clean all
+
+RUN curl -fsSL -o /tmp/clojure-install.sh \
+      https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh \
+ && bash /tmp/clojure-install.sh \
+ && rm /tmp/clojure-install.sh
+
+WORKDIR /coffi
+COPY deps.edn build.clj ./
+COPY src src
+COPY resources resources
+COPY examples examples
+
+WORKDIR /coffi/examples/native-image
+RUN clojure -P
+
+ENTRYPOINT ["/bin/bash", "build.sh"]
