@@ -139,6 +139,24 @@ Single-shot runs including startup, default settings on both sides, GraalVM
 CE 25 in a Linux x64 container; peak RSS and CPU are read from `/proc/self`
 by the process itself.
 
+**Calibrating to your machine** — absolute numbers below only hold on the
+machine that produced them, so the repo ships a fixed zero-dependency
+reference workload that scores any machine on the two axes the benchmarks
+stress:
+
+```sh
+docker build -f Dockerfile.reference -t coffi-reference . && docker run --rm coffi-reference
+```
+
+It prints a cpu time, a mem time, and `score` — their geometric mean, the
+machine's single calibration number. The machine behind the tables scores
+**161** (`cpu_ms=141 mem_ms=184`). To estimate an absolute number on your
+machine, multiply it by your score over 161. Every `Dockerfile.bench` run
+prints its own score, and each `RESULT` line reports `ref=` — wall time
+divided by that score — so results pasted from different machines are
+directly comparable. Ratios *within* one table (JVM vs native, coffi vs
+jextract) carry over as-is.
+
 **CPU-limited** — 1M small FFI calls (`ack(2,3)`), then one `ack(3,11)`
 (~1e9 recursive calls inside C, a single call boundary):
 
@@ -266,5 +284,6 @@ These features are planned for future releases.
 ## License
 
 Copyright © 2023 Joshua Suskalo
+Copyright © 2026 Magnus Rentsch Ersdal (fork)
 
 Distributed under the Eclipse Public License version 1.0.
