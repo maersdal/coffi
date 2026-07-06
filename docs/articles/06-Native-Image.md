@@ -116,7 +116,7 @@ native image:
   than trusting defaults near the cliff.
 
 See the benchmarks section of the README for all numbers, and
-`examples/benchmarks/build.sh` for a harness with these knobs wired up
+`examples/benchmarks/build.bb` for a harness with these knobs wired up
 (`BASE_IMAGE`, `EXTRA_NATIVE_OPTS`, `PGO=1`).
 
 ## What doesn't carry over

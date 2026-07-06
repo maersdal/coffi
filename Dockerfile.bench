@@ -14,6 +14,10 @@ RUN curl -fsSL -o /tmp/clojure-install.sh \
  && bash /tmp/clojure-install.sh \
  && rm /tmp/clojure-install.sh
 
+ARG BB_VERSION=1.12.218
+RUN curl -fsSL https://github.com/babashka/babashka/releases/download/v${BB_VERSION}/babashka-${BB_VERSION}-linux-amd64-static.tar.gz \
+    | tar -xz -C /usr/local/bin
+
 WORKDIR /coffi
 COPY deps.edn build.clj ./
 COPY src src
@@ -23,4 +27,4 @@ COPY examples examples
 WORKDIR /coffi/examples/benchmarks
 RUN clojure -P
 
-ENTRYPOINT ["/bin/bash", "build.sh"]
+ENTRYPOINT ["bb", "build.bb"]

@@ -1,0 +1,18 @@
+# Prints this machine's calibration scores for the benchmark numbers
+# published in the README ("Calibrating to your machine").
+#
+#   docker build -f Dockerfile.reference -t coffi-reference .
+#   docker run --rm coffi-reference
+#
+# Use the same BASE_IMAGE you would pass to Dockerfile.bench: the scores
+# depend on the JIT as much as the hardware, so the reference must run on
+# the same JVM the benchmarks ran on.
+ARG BASE_IMAGE=ghcr.io/graalvm/native-image-community:25
+FROM ${BASE_IMAGE}
+
+WORKDIR /reference
+COPY examples/benchmarks/java/Reference.java .
+RUN javac Reference.java
+
+# heap is pinned so GC behavior doesn't vary with the host's RAM
+ENTRYPOINT ["java", "-Xmx2g", "Reference"]
