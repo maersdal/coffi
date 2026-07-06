@@ -3,6 +3,7 @@
   (:require
    [clojure.java.io :as io]
    [clojure.spec.alpha :as s]
+   [clojure.string :as str]
    [coffi.mem :as mem]
    [insn.core :as insn])
   (:import
@@ -14,20 +15,36 @@
     MethodHandles
     MethodType)
    (java.lang.foreign
+    AddressLayout
     Arena
     Linker
     Linker$Option
     FunctionDescriptor
     MemoryLayout
     MemorySegment
+    PaddingLayout
     SegmentAllocator
-    SymbolLookup)
+    SequenceLayout
+    StructLayout
+    SymbolLookup
+    UnionLayout
+    ValueLayout$OfBoolean
+    ValueLayout$OfByte
+    ValueLayout$OfChar
+    ValueLayout$OfDouble
+    ValueLayout$OfFloat
+    ValueLayout$OfInt
+    ValueLayout$OfLong
+    ValueLayout$OfShort)
    (java.security MessageDigest)
    (java.util LinkedHashMap)
    (java.util.concurrent ConcurrentHashMap)
    (java.util.regex Pattern)))
 
-(set! *warn-on-reflection* true)
+;; set! requires a thread binding, which is absent when this namespace is
+;; initialized as an AOT-compiled class (e.g. GraalVM native-image build time)
+(when (thread-bound? #'*warn-on-reflection*)
+  (set! *warn-on-reflection* true))
 
 ;;; FFI Code loading and function access
 ;;
@@ -196,6 +213,46 @@
       (throw (UnsatisfiedLinkError.
               (str "Could not resolve native symbol: " sym-name)))))
 
+(defn- native-image-build-time?
+  "Checks whether this is executing inside the GraalVM native-image build JVM.
+
+  During an image build, downcall handles must not be created and native
+  memory must not be resolved: both would bake build-machine addresses into
+  the image heap. Downcall construction is deferred to image runtime instead."
+  []
+  (= "buildtime" (System/getProperty "org.graalvm.nativeimage.imagecode")))
+
+(declare ^:private downcall-class-ctor ^:private upcall-class-ctor
+         ^:private record-descriptor! ^:private function-descriptor)
+
+(defn- fn-types
+  "Returns every `[::coffi.ffi/fn ...]` type nested in `types`."
+  [types]
+  (filter #(and (vector? %) (= ::fn (first %)))
+          (tree-seq coll? seq types)))
+
+(defn- record-fn-type-descriptors!
+  "Records upcall and downcall descriptors for every fn type nested in
+  `types`, so native-image metadata covers callbacks that are constructed
+  but not exercised in this session."
+  [types]
+  (doseq [[_fn arg-types ret-type] (fn-types types)]
+    (record-descriptor! :upcalls (function-descriptor arg-types ret-type))
+    (record-descriptor! :downcalls (function-descriptor arg-types ret-type))))
+
+(defn- warm-fn-wrapper-classes!
+  "Generates the upcall and downcall wrapper classes for every
+  `[::coffi.ffi/fn ...]` type nested in `types`.
+
+  Wrapper classes cannot be defined at native-image runtime, so any fn type
+  that will be serialized (passed as a callback) or deserialized (received as
+  a function pointer) at runtime must have its classes generated during the
+  image build."
+  [types]
+  (doseq [[_fn arg-types ret-type] (fn-types types)]
+    (upcall-class-ctor arg-types ret-type)
+    (downcall-class-ctor arg-types ret-type)))
+
 (defn- function-descriptor
   "Gets the [[FunctionDescriptor]] for a set of `args` and `ret` types."
   ([args] (function-descriptor args ::mem/void))
@@ -208,31 +265,93 @@
        (FunctionDescriptor/ofVoid
         args-arr)))))
 
+(defonce ^:private ffm-descriptors
+  ;; Every function descriptor used for a downcall or upcall in this JVM
+  ;; session, so native-image reachability metadata can be generated from a
+  ;; live session; see [[write-native-image-metadata!]].
+  (atom {:downcalls #{} :upcalls #{}}))
+
+(defn- record-descriptor!
+  "Records a function descriptor under `kind` and returns it."
+  [kind ^FunctionDescriptor fdesc]
+  (swap! ffm-descriptors update kind conj fdesc)
+  fdesc)
+
+(defn- layout->canonical
+  "Gets the canonical type name of a memory layout, in the form used by
+  native-image reachability metadata."
+  [layout]
+  (condp instance? layout
+    AddressLayout "void*"
+    ValueLayout$OfBoolean "bool"
+    ValueLayout$OfByte "jbyte"
+    ValueLayout$OfChar "jchar"
+    ValueLayout$OfShort "jshort"
+    ValueLayout$OfInt "jint"
+    ValueLayout$OfLong "jlong"
+    ValueLayout$OfFloat "jfloat"
+    ValueLayout$OfDouble "jdouble"
+    PaddingLayout (str "padding(" (.byteSize ^MemoryLayout layout) ")")
+    SequenceLayout (str "sequence(" (.elementCount ^SequenceLayout layout) ", "
+                        (layout->canonical (.elementLayout ^SequenceLayout layout)) ")")
+    StructLayout (str "struct(" (str/join ", " (map layout->canonical
+                                                    (.memberLayouts ^StructLayout layout))) ")")
+    UnionLayout (str "union(" (str/join ", " (map layout->canonical
+                                                  (.memberLayouts ^UnionLayout layout))) ")")))
+
+(defn- descriptor->metadata-entry
+  "Gets the reachability-metadata JSON object for a function descriptor."
+  [^FunctionDescriptor fdesc]
+  (let [ret (.returnLayout fdesc)]
+    (str "{"
+         "\"returnType\": \""
+         (if (.isPresent ret) (layout->canonical (.get ret)) "void")
+         "\", "
+         "\"parameterTypes\": ["
+         (str/join ", " (map #(str "\"" (layout->canonical %) "\"")
+                             (.argumentLayouts fdesc)))
+         "]}")))
+
+(defn write-native-image-metadata!
+  "Writes GraalVM native-image reachability metadata for every FFM downcall
+  and upcall descriptor coffi has created in this JVM session.
+
+  Writes `<dir>/reachability-metadata.json` containing the `foreign` section
+  and returns the file path. Pass the directory to native-image via
+  `-H:ConfigurationFileDirectories` (alongside any other config directories,
+  comma-separated).
+
+  Descriptors are recorded when fns are *constructed* — for [[defcfn]] that
+  is namespace load — so requiring the namespaces that define the program's
+  native fns is enough; nothing needs to execute. This gives more complete
+  coverage than the native-image tracing agent, which records callback
+  (upcall) descriptors only when a callback is actually serialized during
+  the traced run."
+  [dir]
+  (let [{:keys [downcalls upcalls]} @ffm-descriptors
+        entries (fn [descriptors]
+                  (str/join ",\n      " (sort (map descriptor->metadata-entry descriptors))))
+        file (io/file dir "reachability-metadata.json")]
+    (io/make-parents file)
+    (spit file (str "{\n  \"foreign\": {\n"
+                    "    \"downcalls\": [\n      " (entries downcalls) "\n    ],\n"
+                    "    \"upcalls\": [\n      " (entries upcalls) "\n    ]\n"
+                    "  }\n}\n"))
+    (str file)))
+
 (defn- downcall-handle
   "Gets the [[MethodHandle]] for the function at the `sym`."
   [sym function-descriptor]
+  (record-descriptor! :downcalls function-descriptor)
   (.downcallHandle (Linker/nativeLinker) sym function-descriptor
                    (make-array Linker$Option 0)))
 
-(def ^:private ^MethodHandle ifn-invoke-handle
-  "Method handle which invokes an [[IFn]] with a single argument."
-  (.findVirtual (MethodHandles/lookup) IFn "invoke"
-                (MethodType/methodType Object ^Class Object)))
-
-(defn- reloadable-downcall-handle
-  "Gets a [[MethodHandle]] which re-resolves `symbol-name` on every call.
-
-  Resolution is a lookup in the [[symbol-cache]], which is invalidated
-  whenever a library is loaded or unloaded, so calls through this handle
-  always target the currently loaded copy of the library."
-  [symbol-name function-descriptor]
-  (MethodHandles/collectArguments
-   (.downcallHandle (Linker/nativeLinker) ^FunctionDescriptor function-descriptor
-                    (make-array Linker$Option 0))
-   0
-   (-> ifn-invoke-handle
-       (MethodHandles/insertArguments 0 (object-array [require-symbol symbol-name]))
-       (.asType (MethodType/methodType MemorySegment)))))
+(defn- unbound-downcall-handle
+  "Gets a [[MethodHandle]] which takes the target address as its first argument."
+  [function-descriptor]
+  (record-descriptor! :downcalls function-descriptor)
+  (.downcallHandle (Linker/nativeLinker) ^FunctionDescriptor function-descriptor
+                   (make-array Linker$Option 0)))
 
 (def ^:private load-instructions
   "Mapping from primitive types to the instruction used to load them onto the stack."
@@ -366,6 +485,83 @@
   method handle without reflection, unboxing primitives when needed."
   (memoize downcall-class-ctor*))
 
+(defn- resolving-downcall-class-ctor*
+  "Returns a function to construct a resolving downcall class for the given
+  `args` and `ret` types.
+
+  Like [[downcall-class-ctor*]], but the class holds an [[IFn]] symbol
+  resolver alongside an unbound downcall handle: each invocation resolves the
+  target address (a cheap cache lookup) and passes it as the handle's first
+  argument. This keeps fns working across library reloads without composing
+  method handles, which GraalVM native-image would have to interpret."
+  [args ret]
+  (let [klass (insn/define
+                {:flags #{:public :final}
+                 :version 8
+                 :super clojure.lang.AFunction
+                 :fields [{:name "downcall_handle"
+                           :type MethodHandle
+                           :flags #{:final}}
+                          {:name "symbol_resolver"
+                           :type IFn
+                           :flags #{:final}}]
+                 :methods [{:name :init
+                            :flags #{:public}
+                            :desc [MethodHandle IFn :void]
+                            :emit [[:aload 0]
+                                   [:dup]
+                                   [:dup]
+                                   [:invokespecial :super :init [:void]]
+                                   [:aload 1]
+                                   [:putfield :this "downcall_handle" MethodHandle]
+                                   [:aload 2]
+                                   [:putfield :this "symbol_resolver" IFn]
+                                   [:return]]}
+                           {:name :invoke
+                            :flags #{:public}
+                            :desc (repeat (cond-> (inc (count args))
+                                            (not (mem/primitive-type ret)) inc)
+                                          Object)
+                            :emit [[:aload 0]
+                                   [:getfield :this "downcall_handle" MethodHandle]
+                                   [:aload 0]
+                                   [:getfield :this "symbol_resolver" IFn]
+                                   [:invokeinterface IFn "invoke" [Object]]
+                                   [:checkcast MemorySegment]
+                                   (when-not (mem/primitive-type ret)
+                                     [[:aload 1]
+                                      [:checkcast SegmentAllocator]])
+                                   (map-indexed
+                                    (fn [idx arg]
+                                      [[:aload (cond-> (inc idx)
+                                                 (not (mem/primitive-type ret)) inc)]
+                                       (to-prim-asm arg)])
+                                    args)
+                                   [:invokevirtual MethodHandle "invokeExact"
+                                    (cond->>
+                                        (conj (mapv insn-layout args)
+                                              (insn-layout ret))
+                                      (not (mem/primitive-type ret)) (cons SegmentAllocator)
+                                      :always (cons MemorySegment))]
+                                   (to-object-asm ret)
+                                   [:areturn]]}]})
+        ctor (.getConstructor klass
+                              (doto ^"[Ljava.lang.Class;" (make-array Class 2)
+                                (aset 0 MethodHandle)
+                                (aset 1 IFn)))]
+    (fn [^MethodHandle h ^IFn resolver]
+      (.newInstance ctor
+                    (doto (object-array 2)
+                      (aset 0 h)
+                      (aset 1 resolver))))))
+
+(def ^:private resolving-downcall-class-ctor
+  "Returns a function to construct a resolving downcall class for the given
+  memoized `args` and `ret` types.
+
+  See [[resolving-downcall-class-ctor*]]."
+  (memoize resolving-downcall-class-ctor*))
+
 (defn- downcall-fn
   "Creates a function to call `handle` without reflection."
   [handle args ret]
@@ -392,15 +588,45 @@
 
   If `symbol-or-addr` is a symbol name rather than an address, the returned
   function re-resolves the symbol on every call (a cheap cache lookup), so it
-  stays valid when the library is reloaded with [[load-library]]."
+  stays valid when the library is reloaded with [[load-library]].
+
+  Under a GraalVM native-image build, construction generates the wrapper
+  class (baking it into the image) but defers symbol resolution and downcall
+  handle creation until the image runs; the function descriptor must be
+  registered in the image's reachability metadata."
   [symbol-or-addr args ret]
-  (-> (if (instance? MemorySegment symbol-or-addr)
-        (downcall-handle symbol-or-addr (function-descriptor args ret))
-        (let [sym-name (name symbol-or-addr)]
-          ;; fail fast at construction time if the symbol doesn't exist
-          (require-symbol sym-name)
-          (reloadable-downcall-handle sym-name (function-descriptor args ret))))
-      (downcall-fn args ret)))
+  (if (instance? MemorySegment symbol-or-addr)
+    (-> (downcall-handle symbol-or-addr (function-descriptor args ret))
+        (downcall-fn args ret))
+    (let [sym-name (name symbol-or-addr)]
+      ;; no symbol probe at construction: the library may be loaded later
+      ;; (e.g. in -main of an AOT-compiled program); a missing symbol throws
+      ;; UnsatisfiedLinkError at call time instead
+      (record-fn-type-descriptors! [args ret])
+      (let [ctor (resolving-downcall-class-ctor args ret)
+            resolver (fn resolve-symbol [] (require-symbol sym-name))
+            make (fn make-downcall-fn []
+                   (ctor (unbound-downcall-handle (function-descriptor args ret))
+                         resolver))]
+        (if (native-image-build-time?)
+          (do (warm-fn-wrapper-classes! [args ret])
+              (if (Boolean/getBoolean "coffi.ffi.eager-native-image-handles")
+                ;; GraalVM 25.1+ supports creating UNBOUND downcall handles
+                ;; at image build time (they hold no native addresses; the
+                ;; target address is passed per call — exactly coffi's
+                ;; design). A baked handle constant-folds into a direct
+                ;; stub call instead of going through method-handle
+                ;; interpretation. Opt in with
+                ;; -J-Dcoffi.ffi.eager-native-image-handles=true on the
+                ;; native-image command line; older GraalVM versions fail
+                ;; the image build with this enabled.
+                (make)
+                ;; default: downcall handle creation is deferred to first
+                ;; call at image runtime, compatible with all GraalVM
+                ;; versions but leaving handle invocation unoptimized
+                (let [f (delay (make))]
+                  (fn [& call-args] (apply @f call-args)))))
+          (make))))))
 
 (defn make-varargs-factory
   "Returns a function for constructing downcalls with additional types for arguments.
@@ -661,11 +887,23 @@
   "Set of primitive types which require 2 indices in the constant pool."
   #{::mem/double ::mem/long})
 
+(defn- method-type
+  "Gets the [[MethodType]] for a set of `args` and `ret` types."
+  ([args] (method-type args ::mem/void))
+  ([args ret]
+   (MethodType/methodType
+    ^Class (mem/java-layout ret)
+    ^"[Ljava.lang.Class;" (into-array Class (map mem/java-layout args)))))
+
 (defn- upcall-class-ctor*
-  "Returns a function to construct an upcall class for the given `arg-types` and `ret-types`.
+  "Returns the constructor fn and unbound `upcall` method handle for an
+  upcall class for the given `arg-types` and `ret-type`.
 
   An upcall class is a class with a single method, `upcall`, which boxes any
-  primitives passed to it and calls a closed over [[IFn]]."
+  primitives passed to it and calls a closed over [[IFn]]. The method handle
+  is resolved when the class is generated, so that no name-based member
+  resolution happens at call time (which would require reflection metadata
+  under GraalVM native-image)."
   [arg-types ret-type]
   (let [klass (insn/define
                 {:flags #{:public :final}
@@ -706,16 +944,18 @@
         ctor (.getConstructor klass
                               (doto ^"[Ljava.lang.Class;" (make-array Class 1)
                                 (aset 0 IFn)))]
-    (fn [^IFn f]
-      (.newInstance ctor
-                    (doto (object-array 1)
-                      (aset 0 f))))))
+    {:ctor (fn [^IFn f]
+             (.newInstance ctor
+                           (doto (object-array 1)
+                             (aset 0 f))))
+     :handle (.findVirtual (MethodHandles/lookup) klass "upcall"
+                           (method-type arg-types ret-type))}))
 
 (def ^:private upcall-class-ctor
-  "Returns a function to construct an upcall class for the given memoized `arg-types` and `ret-types`.
+  "Returns the constructor fn and unbound `upcall` method handle for an
+  upcall class for the given memoized `arg-types` and `ret-type`.
 
-  An upcall class is a class with a single method, `upcall`, which boxes any
-  primitives passed to it and calls a closed over [[IFn]]."
+  See [[upcall-class-ctor*]]."
   (memoize upcall-class-ctor*))
 
 (defn- upcall
@@ -723,24 +963,13 @@
 
   See [[upcall-class-ctor]]."
   [f arg-types ret-type]
-  ((upcall-class-ctor arg-types ret-type) ^IFn f))
-
-(defn- method-type
-  "Gets the [[MethodType]] for a set of `args` and `ret` types."
-  ([args] (method-type args ::mem/void))
-  ([args ret]
-   (MethodType/methodType
-    ^Class (mem/java-layout ret)
-    ^"[Ljava.lang.Class;" (into-array Class (map mem/java-layout args)))))
+  ((:ctor (upcall-class-ctor arg-types ret-type)) ^IFn f))
 
 (defn- upcall-handle
   "Constructs a method handle for invoking `f`, a function of `arg-count` args."
   [f arg-types ret-type]
-  (.bind
-   (MethodHandles/lookup)
-   (upcall f arg-types ret-type)
-   "upcall"
-   (method-type arg-types ret-type)))
+  (.bindTo ^MethodHandle (:handle (upcall-class-ctor arg-types ret-type))
+           (upcall f arg-types ret-type)))
 
 (defmethod mem/primitive-type ::fn
   [_type]
@@ -767,7 +996,8 @@
      ^MethodHandle (cond-> f
                      (not raw-fn?) (upcall-serde-wrapper arg-types ret-type)
                      :always (upcall-handle arg-types ret-type))
-     ^FunctionDescriptor (function-descriptor arg-types ret-type)
+     ^FunctionDescriptor (record-descriptor!
+                          :upcalls (function-descriptor arg-types ret-type))
      ^Arena arena
      (make-array Linker$Option 0))))
 
@@ -986,7 +1216,6 @@
    :style/indent [:defn]}
   [& args]
   (let [args (s/conform ::defcfn-args args)
-        address (gensym "symbol")
         native-sym (gensym "native")
         [arity fn-tail] (-> args :wrapper :fn-tail)
         fn-tail (case arity
@@ -997,8 +1226,7 @@
                               :single-arity [fn-tail]
                               :multi-arity fn-tail
                               nil))]
-    `(let [~address (find-symbol ~(name (:symbol args)))
-           ~(or (-> args :wrapper :native-fn)
+    `(let [~(or (-> args :wrapper :native-fn)
                 native-sym)
            (-> (make-downcall ~(name (:symbol args)) ~(:native-arglist args) ~(:return-type args))
                (make-serde-wrapper ~(:native-arglist args) ~(:return-type args)))
@@ -1021,8 +1249,7 @@
                                                name
                                                symbol))
                                          (:native-arglist args)))))))
-                   (assoc (:attr-map args)
-                          ::address address)))
+                   (:attr-map args)))
          ~@(when-let [doc (:doc args)]
              (list doc))
          fun#))))

@@ -15,7 +15,6 @@
   overriden to allow marshaling values of the type into and out of memory
   segments."
   (:require
-   [clojure.pprint :as pprint]
    [clojure.set :as set]
    [clojure.spec.alpha :as s])
   (:import
@@ -40,7 +39,10 @@
    (java.nio ByteOrder))
   (:refer-clojure :exclude [defstruct]))
 
-(set! *warn-on-reflection* true)
+;; set! requires a thread binding, which is absent when this namespace is
+;; initialized as an AOT-compiled class (e.g. GraalVM native-image build time)
+(when (thread-bound? #'*warn-on-reflection*)
+  (set! *warn-on-reflection* true))
 
 (defn confined-arena
   "Constructs a new arena for use only in this thread.
@@ -239,51 +241,51 @@
   "The [[MemoryLayout]] for a native pointer in [[native-endian]] [[ByteOrder]]."
   ValueLayout/ADDRESS)
 
-(def ^long short-size
+(def short-size
   "The size in bytes of a c-sized short."
   (.byteSize short-layout))
 
-(def ^long int-size
+(def int-size
   "The size in bytes of a c-sized int."
   (.byteSize int-layout))
 
-(def ^long long-size
+(def long-size
   "The size in bytes of a c-sized long."
   (.byteSize long-layout))
 
-(def ^long float-size
+(def float-size
   "The size in bytes of a c-sized float."
   (.byteSize float-layout))
 
-(def ^long double-size
+(def double-size
   "The size in bytes of a c-sized double."
   (.byteSize double-layout))
 
-(def ^long pointer-size
+(def pointer-size
   "The size in bytes of a c-sized pointer."
   (.byteSize pointer-layout))
 
-(def ^long short-alignment
+(def short-alignment
   "The alignment in bytes of a c-sized short."
   (.byteAlignment short-layout))
 
-(def ^long int-alignment
+(def int-alignment
   "The alignment in bytes of a c-sized int."
   (.byteAlignment int-layout))
 
-(def ^long long-alignment
+(def long-alignment
   "The alignment in bytes of a c-sized long."
   (.byteAlignment long-layout))
 
-(def ^long float-alignment
+(def float-alignment
   "The alignment in bytes of a c-sized float."
   (.byteAlignment float-layout))
 
-(def ^long double-alignment
+(def double-alignment
   "The alignment in bytes of a c-sized double."
   (.byteAlignment double-layout))
 
-(def ^long pointer-alignment
+(def pointer-alignment
   "The alignment in bytes of a c-sized pointer."
   (.byteAlignment pointer-layout))
 
@@ -1641,14 +1643,32 @@
    ::float float-array
    ::double double-array})
 
+(defn- bulk-primitive-array
+  "Bulk-copies `count` elements of primitive `type` out of `segment`.
+
+  A single intrinsified copy, rather than a slice allocation and a
+  deserialization dispatch per element."
+  [segment type count]
+  (let [sliced ^MemorySegment (slice segment 0 (* (long count) (size-of type)))]
+    (condp identical? type
+      ::byte (.toArray sliced ^ValueLayout$OfByte byte-layout)
+      ::short (.toArray sliced ^ValueLayout$OfShort short-layout)
+      ::int (.toArray sliced ^ValueLayout$OfInt int-layout)
+      ::long (.toArray sliced ^ValueLayout$OfLong long-layout)
+      ::float (.toArray sliced ^ValueLayout$OfFloat float-layout)
+      ::double (.toArray sliced ^ValueLayout$OfDouble double-layout))))
+
 (defmethod deserialize-from ::array
   [segment [_array type count & {:keys [raw?]}]]
-  (let [segments (slice-segments (slice segment 0 (* count (size-of type)))
-                                 (size-of type))]
-    (if raw?
-      ((primitive-array-type type object-array)
-       (sequence (map #(deserialize-from % type)) segments))
-      (mapv #(deserialize-from % type) segments))))
+  (if (contains? primitive-array-type type)
+    (let [arr (bulk-primitive-array segment type count)]
+      (if raw? arr (vec arr)))
+    (let [segments (slice-segments (slice segment 0 (* count (size-of type)))
+                                   (size-of type))]
+      (if raw?
+        ((primitive-array-type type object-array)
+         (sequence (map #(deserialize-from % type)) segments))
+        (mapv #(deserialize-from % type) segments)))))
 
 ;;; Enum types
 
@@ -2249,7 +2269,13 @@
              ~(generate-deserialize coffi-typename 0 segment-form))
            (defmethod serialize-into ~coffi-typename ~[(with-meta 'source-obj {:tag typename}) '_type segment-form '_]
              ~(generate-serialize coffi-typename (with-meta 'source-obj {:tag typename}) 0 segment-form))
-           (defmethod pprint/simple-dispatch ~typename [~'obj] (pprint/simple-dispatch (into {} ~'obj)))
+           ;; pprint support is best-effort: requiring clojure.pprint drags it
+           ;; into AOT compilation, where its top-level set! breaks GraalVM
+           ;; native-image build-time initialization
+           (when-some [simple-dispatch# (try @(requiring-resolve 'clojure.pprint/simple-dispatch)
+                                             (catch Exception ~'_ nil))]
+             (.addMethod ^clojure.lang.MultiFn simple-dispatch# ~typename
+                         (fn [~'obj] (simple-dispatch# (into {} ~'obj)))))
            (defmethod clojure.core/print-method ~typename [~'obj ~'writer] (print-simple (into {} ~'obj) ~'writer)))))))
 
 
