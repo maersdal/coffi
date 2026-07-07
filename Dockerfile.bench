@@ -4,6 +4,12 @@
 #   docker run --rm coffi-bench
 # Community edition by default; for PGO and the G1 collector use:
 #   --build-arg BASE_IMAGE=container-registry.oracle.com/graalvm/native-image:25
+# The native-image build happens inside `docker run`, so tuning knobs are
+# runtime env vars (see BENCHMARKS.md), e.g. PGO and coffi's eager downcall
+# handles (GraalVM 25.1+ only, e.g.
+# --build-arg BASE_IMAGE=ghcr.io/graalvm/native-image-community:25i1;
+# GraalVM 25.0.x fails the image build with the flag):
+#   docker run --rm -e EXTRA_NATIVE_OPTS=-J-Dcoffi.ffi.eager-native-image-handles=true coffi-bench
 ARG BASE_IMAGE=ghcr.io/graalvm/native-image-community:25
 FROM ${BASE_IMAGE}
 

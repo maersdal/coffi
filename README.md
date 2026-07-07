@@ -131,133 +131,16 @@ There is also a [third party round up](https://docs.google.com/spreadsheets/d/1V
 of FFI options for Clojure.
 
 ## JVM vs Native Image Benchmarks
-Two benchmarks compare running the identical AOT-compiled Clojure program on
-the JVM and as a GraalVM native image, both calling C through coffi. Source
-and harness live in `examples/benchmarks/` (run with
-`docker build -f Dockerfile.bench -t coffi-bench . && docker run --rm coffi-bench`).
-Single-shot runs including startup, default settings on both sides, GraalVM
-CE 25 in a Linux x64 container; peak RSS and CPU are read from `/proc/self`
-by the process itself.
-
-**Calibrating to your machine** — absolute numbers below only hold on the
-machine that produced them, so the repo ships a fixed zero-dependency
-reference workload that scores any machine on the two axes the benchmarks
-stress:
-
-```sh
-docker build -f Dockerfile.reference -t coffi-reference . && docker run --rm coffi-reference
-```
-
-It prints a cpu time, a mem time, and `score` — their geometric mean, the
-machine's single calibration number. The machine behind the tables scores
-**161** (`cpu_ms=141 mem_ms=184`). To estimate an absolute number on your
-machine, multiply it by your score over 161. Every `Dockerfile.bench` run
-prints its own score, and each `RESULT` line reports `ref=` — wall time
-divided by that score — so results pasted from different machines are
-directly comparable. Ratios *within* one table (JVM vs native, coffi vs
-jextract) carry over as-is.
-
-**CPU-limited** — 1M small FFI calls (`ack(2,3)`), then one `ack(3,11)`
-(~1e9 recursive calls inside C, a single call boundary):
-
-| | JVM | native image |
-|---|---|---|
-| FFI call overhead | 41 ns/call | 4.1 µs/call |
-| C compute (`ack(3,11)`) | 45 ms | 45 ms |
-| wall incl. startup | 0.68 s | 4.10 s |
-| startup (wall − work) | ~0.6 s | ~10 ms |
-| peak RSS | 351 MB | 73 MB |
-
-**Memory-limited** — 30 iterations of: C fills a 16 MB native float buffer,
-which is deserialized into a boxed Clojure vector (4M `Float`s), retaining a
-sliding window of 3 (sustained managed-heap churn):
-
-| | JVM | native image |
-|---|---|---|
-| wall | 4.4 s | 14.4 s |
-| CPU time | 21.1 s | 14.2 s |
-| peak RSS | 3.4 GB | 4.9 GB |
-
-**Pure Clojure baselines** — the same workloads with the FFI and C removed
-(`cpu-pure`: Ackermann implemented in Clojure; `mem-pure`: the same boxed
-vector churn generated from `range`), isolating the runtimes themselves:
-
-| | JVM | native image |
-|---|---|---|
-| Clojure compute (`ack-clj(3,11)`) | 148 ms | 983 ms |
-| allocation churn wall | 2.6 s | 15.2 s |
-| peak RSS (compute run) | 339 MB | 17 MB |
-
-**Tuned native image** — the community-edition numbers above are the floor,
-not the ceiling. Rebuilding with GraalVM 25.1+, the G1 collector
-(`EXTRA_NATIVE_OPTS=--gc=G1`, Oracle GraalVM), and coffi's eager downcall
-handles (`-J-Dcoffi.ffi.eager-native-image-handles=true`):
-
-| | JVM | CE native | GraalVM 25.1 tuned |
-|---|---|---|---|
-| FFI call overhead | 41 ns | 4.1 µs | **346 ns** (228 ns with PGO) |
-| jextract-pattern control | 21 ns | 3.9 µs | 1.7–2.3 µs |
-| Clojure compute | 244 ms | 983 ms | 330 ms |
-| mem wall (FFI) | 4.9 s | 14.0 s | **3.8 s** |
-| mem-pure wall | 3.1 s | 15.2 s | **3.1 s** (1.8 s with PGO) |
-| peak RSS (compute run) | ~350 MB | 73 MB | 18 MB |
-
-The FFI breakthrough: GraalVM 25.1+ supports creating **unbound** downcall
-handles at image build time. A baked handle is a compile-time constant, so
-`invokeExact` intrinsifies into a direct call to the AOT stub — a plain
-function-pointer call — instead of interpreted method-handle dispatch.
-Coffi's reload architecture (unbound handles, target address passed per
-call) is exactly the required shape, and opts in with
-`-J-Dcoffi.ffi.eager-native-image-handles=true` on the native-image command
-line (GraalVM 25.0 and older fail the image build with this enabled, hence
-opt-in). Bound handles — including everything jextract generates — cannot
-take this path, which is why the jextract control stays microseconds while
-coffi drops to ~300 ns: **coffi is ~7x faster than the jextract pattern on
-native image**, and the tuned CPU benchmark beats the JVM on total wall
-time including startup.
-
-Other practical notes from getting there: plain `-O3 -march=native` changed
-nothing (the gaps were never about instruction selection); with G1 and PGO,
-native image wins both memory benchmarks outright; and PGO profiles from
-multiple runs must be dumped to separate files and merged
-(`--pgo=a.iprof,b.iprof`) — a stale single profile marks unprofiled hot
-paths as cold and makes them slower than no PGO at all.
-
-The shape of the results, with each factor isolated:
-
-- **Pure C compute is at parity** — the same machine code runs either way.
-- **Compiled Clojure runs ~6.6x slower under native image** — HotSpot's C2
-  with runtime profiles beats GraalVM CE's ahead-of-time compilation on hot
-  Clojure code. Profile-guided optimization (Oracle GraalVM) narrows this.
-- **Allocation-heavy code runs ~6x slower with no FFI involved at all** —
-  the mem gap is the collector and allocation paths (Serial GC vs G1), not
-  the native boundary: the FFI variant of the mem benchmark is actually
-  slightly *faster* than the pure one on native, since its bulk `toArray`
-  reads replace Clojure-side generation.
-- **Native image wins on startup (~100x) and idle footprint (~4x)** — the
-  classic native-image strengths carry over to FFI programs.
-- **The JVM wins decisively on chatty FFI (~100x per call, ~50x with PGO)**,
-  and beats *community-edition* native on allocation-heavy managed code
-  (~3x) — though Oracle GraalVM with G1 inverts that, as shown above. The
-  per-call cost is GraalVM's,
-  not coffi's: a control benchmark using the canonical jextract pattern (a
-  downcall handle in a static final field, `invokeExact` with exact types
-  from plain Java) measures 3.9 µs/call on native image versus coffi's
-  4.1 µs — downcall invocation is currently always unoptimized in native
-  image ([oracle/graal#8113](https://github.com/oracle/graal/issues/8113)).
-  Coffi's reload-aware call machinery itself costs ~22 ns/call on the JVM
-  (43 ns vs the 21 ns jextract pattern) and ~4% of a native call. Bulk
-  segment copies (`toArray`, and coffi's primitive-array deserialization
-  built on it) run at full speed in both modes.
-
-In short: a native image suits coarse-grained FFI (few calls that do real
-work in C) and anything where startup or memory footprint dominates — and
-with Oracle GraalVM, G1, and PGO it matches or beats the JVM on everything
-measured here except per-call FFI latency, which remains the JVM's until
-GraalVM optimizes downcalls. Community-edition defaults are markedly slower
-on managed-code-heavy workloads; the edition, collector, and profiles
-matter far more than `-O` flags. Numbers are from one machine and one
-GraalVM version — rerun the harness on yours.
+Benchmarks comparing the identical AOT-compiled Clojure program on the JVM
+and as a GraalVM native image, both calling C through coffi, live in
+[BENCHMARKS.md](BENCHMARKS.md) — methodology, machine calibration, full
+tables, and tuning knobs. Harness and source: `examples/benchmarks/`.
+Headline: bulk copies and C compute run at full speed in both modes;
+native image wins startup and footprint; a warm JVM wins chatty per-call
+FFI (a GraalVM downcall limitation, not coffi's); and on GraalVM 25.1+
+with coffi's eager downcall handles, native per-call cost drops ~9.5x to
+~420 ns — ~8x faster than the jextract pattern, whose bound handles
+cannot take that path.
 
 ## Known Issues
 The project author is aware of these issues and plans to fix them in a future
