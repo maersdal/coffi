@@ -11,9 +11,12 @@
     IDeref IFn IMeta IObj IReference)
    (java.io File InputStream)
    (java.lang.invoke
+    CallSite
     MethodHandle
     MethodHandles
-    MethodType)
+    MethodHandles$Lookup
+    MethodType
+    MutableCallSite)
    (java.lang.foreign
     AddressLayout
     Arena
@@ -70,10 +73,33 @@
   (LinkedHashMap.))
 
 (def ^:private symbol-cache
-  "Cache of resolved symbol addresses, so that re-resolving a symbol on every
-  call is just a map lookup. Invalidated whenever a library is loaded or
-  unloaded."
+  "Cache of resolved symbol addresses, so that repeated resolution — e.g. by
+  the native-image call path, which re-resolves on every call — is just a
+  map lookup. Invalidated whenever a library is loaded or unloaded."
   (ConcurrentHashMap.))
+
+(def ^:private downcall-sites
+  "Registry of `[site fallback]` pairs, one per reload-aware downcall
+  [[MutableCallSite]], so library loads and unloads can retarget every site
+  back to its resolving fallback. All access must hold the lock
+  on [[libraries]]."
+  (java.util.ArrayList.))
+
+(defn- reset-downcall-sites!
+  "Retargets every registered downcall call site back to its resolving
+  fallback and syncs the change to all threads, so the next call through
+  each site re-resolves its symbol. Must be called while holding the lock
+  on [[libraries]], whenever a library is loaded or unloaded."
+  []
+  (let [n (.size ^java.util.ArrayList downcall-sites)
+        sites ^"[Ljava.lang.invoke.MutableCallSite;" (make-array MutableCallSite n)]
+    (dotimes [i n]
+      (let [[^MutableCallSite site ^MethodHandle fallback]
+            (.get ^java.util.ArrayList downcall-sites i)]
+        (.setTarget site fallback)
+        (aset sites i site)))
+    (MutableCallSite/syncAll sites))
+  nil)
 
 (defn- hash-file
   "Computes the SHA-256 digest of the contents of the file at `path`."
@@ -95,7 +121,8 @@
   [key ^String target content-hash]
   (when-some [old (.remove ^LinkedHashMap libraries key)]
     (.close ^Arena (:arena old))
-    (.clear ^ConcurrentHashMap symbol-cache))
+    (.clear ^ConcurrentHashMap symbol-cache)
+    (reset-downcall-sites!))
   (let [arena (Arena/ofShared)]
     (try
       (.put ^LinkedHashMap libraries key
@@ -103,6 +130,7 @@
              :lookup (SymbolLookup/libraryLookup target arena)
              :content-hash content-hash})
       (.clear ^ConcurrentHashMap symbol-cache)
+      (reset-downcall-sites!)
       nil
       (catch RuntimeException e
         (.close arena)
@@ -115,8 +143,12 @@
   this is a no-op. If the contents have changed (e.g. it was recompiled), the
   old library is unloaded and replaced, so this can be called again after
   recompiling a library to pick up the new code. Fns created from symbol
-  names (e.g. via [[defcfn]] or [[cfn]]) re-resolve their symbol on each call
-  and keep working across reloads.
+  names (e.g. via [[defcfn]] or [[cfn]]) relink to the fresh library on
+  their next call and keep working across reloads. By default a reload does
+  not wait for calls in flight on other threads — reloading a library while
+  it is being called into concurrently is undefined behavior unless the
+  `coffi.ffi.protected-downcalls` system property is set
+  (see [[make-downcall]]).
 
   Reloading has caveats which coffi cannot detect or prevent; see the
   \"Reloading Libraries\" section of the Getting Started article for the
@@ -141,7 +173,11 @@
   On Windows the library file is locked while loaded, so it must be unloaded
   before it can be recompiled. Fns created from the library's symbols throw
   [[UnsatisfiedLinkError]] while it is unloaded; raw addresses and pointers
-  obtained from it are dangling, and using them may crash the JVM.
+  obtained from it are dangling, and using them may crash the JVM. By
+  default unloading does not wait for calls in flight on other threads —
+  unloading a library while it is being called into concurrently is
+  undefined behavior unless the `coffi.ffi.protected-downcalls` system
+  property is set (see [[make-downcall]]).
 
   The OS may keep a library mapped despite unloading (e.g. when it is a
   dependency of another loaded library, or is pinned by TLS destructors); in
@@ -151,7 +187,8 @@
     (locking libraries
       (when-some [entry (.remove ^LinkedHashMap libraries filepath)]
         (.close ^Arena (:arena entry))
-        (.clear ^ConcurrentHashMap symbol-cache))))
+        (.clear ^ConcurrentHashMap symbol-cache)
+        (reset-downcall-sites!))))
   nil)
 
 (defn load-system-library
@@ -562,6 +599,159 @@
   See [[resolving-downcall-class-ctor*]]."
   (memoize resolving-downcall-class-ctor*))
 
+(def ^:private indy-callsites
+  "The [[MutableCallSite]] of every [[callsite-downcall-fn*]]-generated
+  class, keyed by the boxed `Integer` id embedded in the class's
+  `invokedynamic` instruction; read by [[callsite-for-id]] when the JVM
+  links the instruction."
+  (ConcurrentHashMap.))
+
+(def ^:private indy-callsite-ids
+  (java.util.concurrent.atomic.AtomicInteger.))
+
+(defn- callsite-for-id
+  "Returns the registered downcall call site with `id`. Called by name from
+  the `invokedynamic` bootstrap method of generated downcall classes."
+  [id]
+  (.get ^ConcurrentHashMap indy-callsites id))
+
+(def ^:private indy-bootstrap-class
+  "Class holding the `invokedynamic` bootstrap method for generated downcall
+  classes. The bootstrap ignores the standard lookup arguments and returns
+  the call site registered under the instruction's id constant."
+  (delay
+    (insn/define
+      {:flags #{:public :final}
+       :version 8
+       :methods [{:name "bootstrap"
+                  :flags #{:public :static}
+                  :desc [MethodHandles$Lookup String MethodType :int CallSite]
+                  :emit [[:ldc "coffi.ffi"]
+                         [:ldc "callsite-for-id"]
+                         [:invokestatic clojure.java.api.Clojure "var"
+                          [Object Object IFn]]
+                         [:iload 3]
+                         [:invokestatic Integer "valueOf" [:int Integer]]
+                         [:invokeinterface IFn "invoke" [Object Object]]
+                         [:checkcast CallSite]
+                         [:areturn]]}]})))
+
+(defn- link-downcall-site!
+  "Slow path of a lazily linked downcall call site: resolves `sym-name`,
+  retargets `site` to `unbound` bound to the resolved address, and completes
+  the pending call with `args`.
+
+  Runs on a downcall fn's first call and on its first call after any library
+  load or unload. Resolution and retargeting happen under the [[libraries]]
+  lock so a concurrent load or unload cannot leave the site targeting a
+  stale address.
+
+  By default the resolved address is rebased to the global scope before
+  binding, so calls pay no per-call liveness check; the trade is that
+  loading or unloading a library while another thread is inside a call into
+  it unmaps the code mid-call — undefined behavior. Under
+  `coffi.ffi.protected-downcalls` the handle is bound to the address as
+  resolved, scoped to its library's arena: every call then pays the FFM
+  liveness protocol (a scope acquire/release, ~7ns, more under contention)
+  which makes [[unload-library]] and reloads wait for in-flight calls
+  before unmapping."
+  [^MutableCallSite site fdesc sym-name ^objects args]
+  (let [^MethodHandle bound
+        (locking libraries
+          (let [addr ^MemorySegment (require-symbol sym-name)
+                addr (if (Boolean/getBoolean "coffi.ffi.protected-downcalls")
+                       addr
+                       (MemorySegment/ofAddress (.address addr)))
+                bound ^MethodHandle (downcall-handle addr fdesc)]
+            (.setTarget site bound)
+            bound))]
+    (.invokeWithArguments bound ^java.util.List (java.util.Arrays/asList args))))
+
+(defn- callsite-downcall-fn*
+  "Creates an [[IFn]] that calls the native function `sym-name` through
+  a [[MutableCallSite]].
+
+  The generated class calls the site via an `invokedynamic` instruction
+  whose bootstrap returns the site, so the JIT treats the current target —
+  the downcall handle bound to the resolved address — as a constant and
+  compiles calls down to a direct native call, the same machine code as a
+  downcall handle in a hand-written `static final` field. Library loads and
+  unloads retarget every site back to its resolving fallback
+  (see [[reset-downcall-sites!]]), deoptimizing any compiled calls, and the
+  next call relinks — so reload support costs nothing per call in steady
+  state.
+
+  Steady-state calls run at parity with a hand-written `static final`
+  downcall handle; the only optional per-call cost is the liveness check
+  enabled by `coffi.ffi.protected-downcalls`, which makes unloading a
+  library wait for calls in flight on other threads
+  (see [[link-downcall-site!]])."
+  [sym-name args ret]
+  (let [fdesc (function-descriptor args ret)
+        ;; created only for its type — the bound handle's, sans the leading
+        ;; address parameter — so linking can be deferred past construction
+        unbound ^MethodHandle (unbound-downcall-handle fdesc)
+        type (.dropParameterTypes (.type unbound) 0 1)
+        site (MutableCallSite. ^MethodType type)
+        slow (fn link-and-call [args-arr]
+               (link-downcall-site! site fdesc sym-name args-arr))
+        fallback (-> (.findVirtual (MethodHandles/lookup) IFn "invoke"
+                                   (MethodType/genericMethodType 1))
+                     (.bindTo slow)
+                     (.asCollector (class (object-array 0)) (.parameterCount type))
+                     (.asType type))
+        id (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger
+                             indy-callsite-ids)]
+    (.setTarget site fallback)
+    ;; registered before the class can execute its invokedynamic, whose
+    ;; bootstrap looks the site up by id
+    (.put ^ConcurrentHashMap indy-callsites (Integer/valueOf id) site)
+    (locking libraries
+      (.add ^java.util.ArrayList downcall-sites [site fallback]))
+    (let [klass (insn/define
+                  {:flags #{:public :final}
+                   :version 8
+                   :super clojure.lang.AFunction
+                   :methods [{:name :init
+                              :flags #{:public}
+                              :desc [:void]
+                              :emit [[:aload 0]
+                                     [:invokespecial :super :init [:void]]
+                                     [:return]]}
+                             {:name :invoke
+                              :flags #{:public}
+                              :desc (repeat (cond-> (inc (count args))
+                                              (not (mem/primitive-type ret)) inc)
+                                            Object)
+                              :emit [(when-not (mem/primitive-type ret)
+                                       [[:aload 1]
+                                        [:checkcast SegmentAllocator]])
+                                     (map-indexed
+                                      (fn [idx arg]
+                                        [[:aload (cond-> (inc idx)
+                                                   (not (mem/primitive-type ret)) inc)]
+                                         (to-prim-asm arg)])
+                                      args)
+                                     [:invokedynamic "downcall"
+                                      (cond->>
+                                          (conj (mapv insn-layout args)
+                                                (insn-layout ret))
+                                        (not (mem/primitive-type ret)) (cons SegmentAllocator))
+                                      [:invokestatic @indy-bootstrap-class "bootstrap"
+                                       [MethodHandles$Lookup String MethodType :int CallSite]]
+                                      [(Integer/valueOf id)]]
+                                     (to-object-asm ret)
+                                     [:areturn]]}]})]
+      (.newInstance (.getConstructor ^Class klass (make-array Class 0))
+                    (object-array 0)))))
+
+(def ^:private callsite-downcall-fn
+  "Memoized [[callsite-downcall-fn*]]: one class and call site per distinct
+  `[sym-name args ret]`, so re-evaluating a [[defcfn]] (e.g. reloading its
+  namespace at the REPL) reuses the existing call site instead of defining a
+  new class."
+  (memoize callsite-downcall-fn*))
+
 (defn- downcall-fn
   "Creates a function to call `handle` without reflection."
   [handle args ret]
@@ -587,8 +777,16 @@
   first argument of a [[SegmentAllocator]].
 
   If `symbol-or-addr` is a symbol name rather than an address, the returned
-  function re-resolves the symbol on every call (a cheap cache lookup), so it
-  stays valid when the library is reloaded with [[load-library]].
+  function calls through a [[MutableCallSite]] which is lazily linked to the
+  resolved symbol on first call and retargeted whenever a library is loaded
+  or unloaded, so it stays valid across [[load-library]] reloads. The JIT
+  compiles the linked site down to a direct native call with no per-call
+  overhead — hand-written-downcall performance. By default this assumes
+  libraries are not unloaded or reloaded while *other threads* are inside
+  calls into them; set the `coffi.ffi.protected-downcalls` system property
+  to true to make every call acquire its library's scope (~7ns/call, more
+  under contention), which makes unloads and reloads wait for calls in
+  flight instead.
 
   Under a GraalVM native-image build, construction generates the wrapper
   class (baking it into the image) but defers symbol resolution and downcall
@@ -603,34 +801,34 @@
       ;; (e.g. in -main of an AOT-compiled program); a missing symbol throws
       ;; UnsatisfiedLinkError at call time instead
       (record-fn-type-descriptors! [args ret])
-      (let [ctor (resolving-downcall-class-ctor args ret)
-            resolver (fn resolve-symbol [] (require-symbol sym-name))
-            make (fn make-downcall-fn []
-                   (ctor (unbound-downcall-handle (function-descriptor args ret))
-                         resolver))]
-        (if (native-image-build-time?)
-          (do (warm-fn-wrapper-classes! [args ret])
-              (if (Boolean/getBoolean "coffi.ffi.eager-native-image-handles")
-                ;; GraalVM 25.1+ supports creating UNBOUND downcall
-                ;; handles at image build time (they hold no native
-                ;; addresses; the target address is passed per call —
-                ;; exactly coffi's design). A baked handle constant-folds
-                ;; into a direct stub call instead of going through
-                ;; method-handle interpretation (~420 ns vs ~4 µs per
-                ;; call). Opt in with
-                ;; -J-Dcoffi.ffi.eager-native-image-handles=true on the
-                ;; native-image command line. NB: that is the GraalVM
-                ;; version, not the JDK version — the 25i1 image tags are
-                ;; GraalVM 25.1.x and work; GraalVM 25.0.x (also on JDK
-                ;; 25) fails the image build with a linkToNative parsing
-                ;; error during analysis, hence opt-in.
-                (make)
-                ;; default: downcall handle creation is deferred to first
-                ;; call at image runtime, compatible with all GraalVM
-                ;; versions but leaving handle invocation unoptimized
-                (let [f (delay (make))]
-                  (fn [& call-args] (apply @f call-args)))))
-          (make))))))
+      (if (native-image-build-time?)
+        (let [ctor (resolving-downcall-class-ctor args ret)
+              resolver (fn resolve-symbol [] (require-symbol sym-name))
+              make (fn make-downcall-fn []
+                     (ctor (unbound-downcall-handle (function-descriptor args ret))
+                           resolver))]
+          (warm-fn-wrapper-classes! [args ret])
+          (if (Boolean/getBoolean "coffi.ffi.eager-native-image-handles")
+            ;; GraalVM 25.1+ supports creating UNBOUND downcall
+            ;; handles at image build time (they hold no native
+            ;; addresses; the target address is passed per call —
+            ;; exactly coffi's design). A baked handle constant-folds
+            ;; into a direct stub call instead of going through
+            ;; method-handle interpretation (~420 ns vs ~4 µs per
+            ;; call). Opt in with
+            ;; -J-Dcoffi.ffi.eager-native-image-handles=true on the
+            ;; native-image command line. NB: that is the GraalVM
+            ;; version, not the JDK version — the 25i1 image tags are
+            ;; GraalVM 25.1.x and work; GraalVM 25.0.x (also on JDK
+            ;; 25) fails the image build with a linkToNative parsing
+            ;; error during analysis, hence opt-in.
+            (make)
+            ;; default: downcall handle creation is deferred to first
+            ;; call at image runtime, compatible with all GraalVM
+            ;; versions but leaving handle invocation unoptimized
+            (let [f (delay (make))]
+              (fn [& call-args] (apply @f call-args)))))
+        (callsite-downcall-fn sym-name args ret)))))
 
 (defn make-varargs-factory
   "Returns a function for constructing downcalls with additional types for arguments.

@@ -1,0 +1,48 @@
+# Runs HEAD's benchmark code against both HEAD's coffi and an older ref's
+# coffi source tree, side by side on the JVM (Linux x64).
+#
+#   docker build -f Dockerfile.compare -t coffi-compare . --build-arg OLD_REF=ae3e38a449c88b998db98b0d4bffa9908dea1c79
+#   docker run --rm coffi-compare
+#
+# Pick the baseline with --build-arg OLD_REF=<sha-or-tag>. JVM-only: the old
+# insn-based implementation generates bytecode at runtime and cannot be built
+# into a native image, so there is no native side to this comparison — use
+# Dockerfile.bench for JVM-vs-native on HEAD.
+ARG BASE_IMAGE=ghcr.io/graalvm/native-image-community:25
+FROM ${BASE_IMAGE}
+
+RUN microdnf install -y bash curl git gcc && microdnf clean all
+
+RUN curl -fsSL -o /tmp/clojure-install.sh \
+      https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh \
+ && bash /tmp/clojure-install.sh \
+ && rm /tmp/clojure-install.sh
+
+ARG BB_VERSION=1.12.218
+RUN curl -fsSL https://github.com/babashka/babashka/releases/download/v${BB_VERSION}/babashka-${BB_VERSION}-linux-amd64-static.tar.gz \
+    | tar -xz -C /usr/local/bin
+
+# the baseline coffi source tree, extracted from git history
+ARG OLD_REF=ae3e38a449c88b998db98b0d4bffa9908dea1c79
+ENV OLD_REF=${OLD_REF}
+COPY .git /tmp/coffi.git
+RUN git clone /tmp/coffi.git /coffi-old \
+ && git -C /coffi-old checkout --detach ${OLD_REF} \
+ && rm -rf /tmp/coffi.git /coffi-old/.git
+
+WORKDIR /coffi
+COPY deps.edn build.clj ./
+COPY src src
+COPY resources resources
+COPY examples examples
+
+WORKDIR /coffi/examples/benchmarks
+# satisfy the old ref's :deps/prep-lib (javac into target/classes) before
+# tools.deps resolves it, then warm both classpaths
+RUN if [ -d /coffi-old/src/java ]; then \
+      javac -d /coffi-old/target/classes $(find /coffi-old/src/java -name '*.java'); \
+    fi \
+ && clojure -P \
+ && clojure -Sdeps "{:aliases {:old {:override-deps {org.suskalo/coffi {:local/root \"/coffi-old\"}}}}}" -A:old -P
+
+ENTRYPOINT ["bb", "compare.bb"]

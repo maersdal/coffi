@@ -228,8 +228,10 @@ Each factor isolated:
   ([oracle/graal#8113](https://github.com/oracle/graal/issues/8113))
   unless the handle can be baked at build time, which only coffi's unbound
   shape allows (~8x faster than jextract there). Coffi's reload-aware call
-  machinery itself costs ~12 ns/call on the JVM (21 ns vs the 9 ns
-  jextract pattern) and ~3% of a CE native call. Bulk segment copies
+  machinery itself cost ~12 ns/call on the JVM when these tables were
+  measured (21 ns vs the 9 ns jextract pattern) and ~3% of a CE native
+  call; the call-site rework (last section) has since cut that to zero
+  by default and ~7 ns with `protected-downcalls`. Bulk segment copies
   (`toArray`, and coffi's primitive-array deserialization built on it) run
   at full speed in both modes.
 
@@ -242,3 +244,84 @@ edges out tuned native everywhere else, while native keeps the footprint
 advantage. Community-edition defaults undersell native badly: the edition,
 collector, profiles, and the eager-handles flag matter far more than `-O`
 flags. Numbers are from one machine — rerun the harness on yours.
+
+## Comparing coffi versions (Dockerfile.compare)
+
+A separate harness runs HEAD's benchmark code against two coffi source
+trees — this checkout and any older ref, extracted from git history — and
+prints them side by side:
+
+```sh
+docker build -f Dockerfile.compare -t coffi-compare .   # --build-arg OLD_REF=<sha-or-tag>
+docker run --rm coffi-compare
+```
+
+JVM only: pre-pure-clojure coffi generates bytecode at runtime (insn),
+which cannot go into a native image, so there is no old-native side. The
+`cpu-java` and `mem-pure` modes don't touch coffi and run as noise
+controls — a delta there is session variance, not a coffi difference.
+(Two old-ref compatibility quirks are handled in the harness and bench
+source: old `defcfn` binds its symbol eagerly at namespace load, so
+`compare.bb` loads the library before requiring `bench.core`; and old
+`mem/float-size` carries a broken `^long` tag, so `bench.core` uses
+`mem/size-of` instead.)
+
+Measured against `ae3e38a` (v1.0.615+17, the last insn + Java-`Loader`
+tree before the pure-clojure transition), two sessions, in-process
+`work_ms` / best-round per-call:
+
+| | old (`ae3e38a`) | HEAD | new/old |
+|---|---|---|---|
+| coffi FFI call overhead | 10 ns/call | 21–22 ns/call | ~2.1x |
+| jextract-pattern control | 9 ns/call | 11 ns/call | — (control) |
+| C compute (`ack(3,11)`) | 45 ms | 45 ms | 1.0x |
+| mem work | 6.0–6.5 s | 4.0–4.1 s | ~0.65x |
+| mem-pure control work | 3.0–3.2 s | 2.6–2.9 s | — (control) |
+
+The pure-clojure transition traded per-call speed for deserialization
+speed. Old insn-generated call classes sat at ~10 ns/call, essentially the
+jextract pattern; HEAD as measured here paid ~11 ns on top. In exchange,
+the mem benchmark's coffi-specific portion (mem minus the mem-pure
+baseline, ~3.2 s → ~1.4 s) got ~2.3x faster at HEAD, and pure C compute is
+at parity, as it must be.
+
+### Where the 11 ns went, and the call-site rework that removed it
+
+Bisecting that 21 ns with single-variable controls (javac vs insn-generated
+classes, born-bound vs retargeted call sites, global vs closeable arenas)
+decomposed it exactly:
+
+- **9 ns floor** — the downcall itself (the jextract control's cost).
+- **~5 ns symbol re-resolution** — the resolver-per-call design: an
+  interface call into a closure plus a `ConcurrentHashMap` hit.
+- **~7 ns FFM liveness protocol** — the sleeper. Since the pure-clojure
+  transition, libraries load via `SymbolLookup/libraryLookup` over a
+  *closeable* arena so `unload-library` can wait out in-flight calls;
+  every call through such an address pays a scope acquire/release. The old
+  `System.load`-based tree never paid this because its addresses had
+  non-closeable scopes — and it could never unload, either.
+
+The rework replaces the resolver with a `MutableCallSite` per symbol,
+called through an `invokedynamic` instruction in the generated class. The
+JIT constant-folds the site's target into a direct native call; library
+loads and unloads retarget every site back to a resolving fallback
+(`MutableCallSite/syncAll`), deoptimizing compiled callers, and the next
+call relinks — so hot reloading works in every mode at zero per-call cost.
+Measured against the resolver design (`OLD_REF=develop`, controls flat):
+
+| | resolver (develop) | call sites (default) | + protected-downcalls |
+|---|---|---|---|
+| coffi FFI call overhead | 21 ns/call | **9 ns/call** | 16 ns/call |
+| jextract-pattern control | 9 ns/call | 9 ns/call | 9 ns/call |
+
+By default the resolved address is rebased to the global scope before
+binding, eliding the liveness check: **9 ns/call — parity with a
+hand-written `static final` downcall handle**. The assumption bought with
+that is that libraries are not unloaded or reloaded *while other threads
+are inside calls into them* (doing so unmaps code mid-call — undefined
+behavior; single-threaded REPL reloading can never trip this). Programs
+that do reload under concurrent call load can set
+`-Dcoffi.ffi.protected-downcalls=true` to bind addresses library-scoped:
+every call then pays the acquire/release (~7 ns single-threaded, more
+under contention — the counter's cache line bounces between cores), and
+unloads wait for calls in flight.
