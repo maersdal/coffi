@@ -611,15 +611,19 @@
         (if (native-image-build-time?)
           (do (warm-fn-wrapper-classes! [args ret])
               (if (Boolean/getBoolean "coffi.ffi.eager-native-image-handles")
-                ;; GraalVM 25.1+ supports creating UNBOUND downcall handles
-                ;; at image build time (they hold no native addresses; the
-                ;; target address is passed per call — exactly coffi's
-                ;; design). A baked handle constant-folds into a direct
-                ;; stub call instead of going through method-handle
-                ;; interpretation. Opt in with
+                ;; GraalVM 25.1+ supports creating UNBOUND downcall
+                ;; handles at image build time (they hold no native
+                ;; addresses; the target address is passed per call —
+                ;; exactly coffi's design). A baked handle constant-folds
+                ;; into a direct stub call instead of going through
+                ;; method-handle interpretation (~420 ns vs ~4 µs per
+                ;; call). Opt in with
                 ;; -J-Dcoffi.ffi.eager-native-image-handles=true on the
-                ;; native-image command line; older GraalVM versions fail
-                ;; the image build with this enabled.
+                ;; native-image command line. NB: that is the GraalVM
+                ;; version, not the JDK version — the 25i1 image tags are
+                ;; GraalVM 25.1.x and work; GraalVM 25.0.x (also on JDK
+                ;; 25) fails the image build with a linkToNative parsing
+                ;; error during analysis, hence opt-in.
                 (make)
                 ;; default: downcall handle creation is deferred to first
                 ;; call at image runtime, compatible with all GraalVM
