@@ -1,44 +1,28 @@
 {:paths ["src/clj" "resources"]
- :deps {org.clojure/clojure {:mvn/version "1.11.1"}
+ :deps {org.clojure/clojure {:mvn/version "1.12.5"}
         insn/insn {:mvn/version "0.5.4"}}
 
  :aliases
  {:dev {:extra-paths ["."]
-        :extra-deps {io.github.clojure/tools.build {:git/tag "v0.3.0" :git/sha "e418fc9"}
-                     nodisassemble/nodisassemble {:mvn/version "0.1.3"}
-                     criterium/criterium {:mvn/version "0.4.6"}}
-        ;; NOTE(Joshua): If you want to use nodisassemble you should also add a
-        ;; -javaagent for the resolved location
+        :extra-deps {io.github.clojure/tools.build {:git/tag "v0.10.14" :git/sha "1176afd"} 
+                     com.clojure-goes-fast/clj-java-decompiler {:mvn/version "0.3.7"}
+                     criterium/criterium {:mvn/version "0.4.6"}} 
         :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
   :test {:extra-paths ["test/clj"]
-         :extra-deps {org.clojure/test.check {:mvn/version "1.1.0"}
+         :extra-deps {org.clojure/test.check {:mvn/version "1.1.3"}
                       io.github.cognitect-labs/test-runner
                       {:git/url "https://github.com/cognitect-labs/test-runner"
-                       :sha "62ef1de18e076903374306060ac0e8a752e57c86"}}
+                       :sha "3f288f1f16d167723ad87cc35b1dfee3c1681e10"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
-         :exec-fn cognitect.test-runner.api/test}
+         :exec-fn cognitect.test-runner.api/test} 
+  
 
-  :codox {:extra-deps {codox/codox {:mvn/version "0.10.8"}
-                       insn/insn {:mvn/version "0.2.1"}}
-          :exec-fn codox.main/generate-docs
-          :exec-args {:name "coffi"
-                      :version "v1.0.615"
-                      :description "A Foreign Function Interface in Clojure for JDK 22+."
-                      :source-paths  ["src/clj"]
-                      :doc-paths ["docs/articles"]
-                      :output-path "docs"
-                      :source-uri "https://github.com/IGJoshua/coffi/blob/{git-commit}/{filepath}#L{line}"
-                      :metadata {:doc/format :markdown}}}
-
-  :build {:replace-deps {org.clojure/clojure {:mvn/version "1.10.3"}
-                         io.github.clojure/tools.build {:git/tag "v0.3.0" :git/sha "e418fc9"}}
+  :build {:replace-deps {org.clojure/clojure {:mvn/version "1.12.5"}
+                         io.github.clojure/tools.build {:git/tag "v0.10.14" :git/sha "1176afd"}}
           :ns-default build
           :exec-fn run-tasks}
-  :install {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
+  :install {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.5"}}
             :exec-fn deps-deploy.deps-deploy/deploy
             :exec-args {:installer :local :artifact "target/coffi.jar"
                         :pom-file "target/pom.xml"}}
-  :deploy {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
-           :exec-fn deps-deploy.deps-deploy/deploy
-           :exec-args {:installer :remote :artifact "target/coffi.jar"
-                       :pom-file "target/pom.xml" :sign-releases? true}}}}
+  }}

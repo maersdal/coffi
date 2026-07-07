@@ -80,7 +80,10 @@
   (loop [iter 0, retained (), checksum 0.0]
     (if (< iter iters)
       (let [v (with-open [arena (mem/confined-arena)]
-                (let [seg (mem/alloc (* n mem/float-size) arena)]
+                ;; size-of, not the float-size var: compare.bb compiles this
+                ;; code against old coffi trees whose float-size carries a
+                ;; broken ^long tag that fails to compile inside arithmetic
+                (let [seg (mem/alloc (* n (mem/size-of ::mem/float)) arena)]
                   (fill-floats seg n)
                   (mem/deserialize-from seg [::mem/array ::mem/float n])))]
         (recur (inc iter)

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file. This change
 - Function `coffi.mem/struct-field-offset` for getting struct field offsets for use with reading/writing with unmarshaled segments that contain structs
 - Support for `:raw?` type flag for array serdes to deserialize to raw java arrays for feature parity with defstruct
 - Reloading of shared libraries
+- System property `coffi.ffi.protected-downcalls` which makes every downcall acquire its library's scope (~7 ns/call), so unloading or reloading a library waits for calls in flight on other threads instead of unmapping code mid-call
+- Comparison benchmark harness (`Dockerfile.compare`) which runs HEAD's benchmark code against any older ref's coffi sources side by side
+
+### Performance
+- Downcall fns created from symbol names now call through a per-symbol `MutableCallSite` linked via `invokedynamic` instead of re-resolving the symbol on every call; library loads and unloads retarget the sites (`MutableCallSite/syncAll`), so hot reloading keeps working. Per-call overhead drops from ~21 ns to ~9 ns — parity with a hand-written `static final` downcall handle. The default no longer waits for in-flight calls on unload/reload; opt back into that with `coffi.ffi.protected-downcalls` (~16 ns/call)
 
 ### Fixed
 - Cyclic dependency when requiring `coffi.layout` before `coffi.mem`

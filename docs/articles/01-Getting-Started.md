@@ -146,10 +146,15 @@ What does not work:
 
 Libraries loaded with `load-library` can be reloaded without restarting the JVM:
  calling `load-library` again is a no-op while the file's contents are unchanged.
-Fns created from symbol names (`defcfn`, `cfn`, etc) re-resolve their symbol on each call.
+Fns created from symbol names (`defcfn`, `cfn`, etc) relink to the fresh library
+on their next call — reload support costs nothing per call.
 `unload-library` unloads a library explicitly; on Windows this is required before recompiling, 
 because the OS locks the file while it is loaded. 
 Calling a fn whose library is unloaded throws `UnsatisfiedLinkError`.
+By default, unloading and reloading do not wait for calls in flight on *other*
+threads; if libraries may be unloaded or reloaded while being called into
+concurrently, set the `coffi.ffi.protected-downcalls` system property (see the
+Configuration article).
 
 Reloading is a REPL-development tool with sharp edges that coffi cannot
 detect or prevent:
