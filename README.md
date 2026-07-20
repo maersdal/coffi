@@ -1,9 +1,6 @@
 # coffi
 
-TODO:rewrite
-
-[![Clojars Project](https://img.shields.io/clojars/v/org.suskalo/coffi.svg)](https://clojars.org/org.suskalo/coffi)
-[![cljdoc badge](https://cljdoc.org/badge/org.suskalo/coffi)](https://cljdoc.org/d/org.suskalo/coffi)
+This is an experimental fork of [IGJoshua/coffi](https://github.com/IGJoshua/coffi) with a lot of changes in testing.
 
 Coffi is a foreign function interface library for Clojure, using the [Foreign
 Function & Memory API](https://openjdk.org/jeps/454) in JDK 22 and later. This
@@ -19,24 +16,13 @@ access the FF&M API gives us.
 - [API Documentation](https://cljdoc.org/d/org.suskalo/coffi/CURRENT/api/coffi)
 - [Recent Changes](CHANGELOG.md)
 
-## Installation
-This library is available on Clojars, or as a git dependency. Add one of the
-following entries to the `:deps` key of your `deps.edn`:
-
-```clojure
-org.suskalo/coffi {:mvn/version "1.0.615"}
-io.github.IGJoshua/coffi {:git/tag "v1.0.615" :git/sha "7401485"}
-```
-
 Coffi is pure Clojure with no compilation step, so it can be used as a git
-dependency directly — no `clj -X:deps prep` is required.
+dependency directly.
 
 Coffi also works under GraalVM native-image (GraalVM for JDK 25+); see the
 Native Image article and `examples/native-image/` for the recipe.
 
-Coffi requires usage of the package `java.lang.foreign`, and most of the
-operations are considered unsafe by the JDK, and are therefore unavailable to
-your code without passing some command line flags. In order to use coffi, add
+Coffi requires usage of the package `java.lang.foreign`, add
 the following JVM arguments to your application.
 
 ```sh
@@ -51,28 +37,20 @@ clj -J--enable-native-access=ALL-UNNAMED
 ```
 
 You can also specify them in an alias in your `deps.edn` file under the
-`:jvm-opts` key (see the next example) and then invoking the CLI with that alias
-using `-M`, `-A`, or `-X`.
+`:jvm-opts` key.
 
 ``` clojure
 {:aliases {:dev {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
 ```
 
-Other build tools should provide similar functionality if you check their
-documentation.
-
 When creating an executable jar file, you can avoid the need to pass this
 argument by adding the manifest attribute `Enable-Native-Access: ALL-UNNAMED` to
-your jar. See your build tool's documentation for how to add this.
+your jar.
 
-Coffi also includes support for the linter clj-kondo. If you use clj-kondo and
-this library's macros are not linting correctly, you may need to install the
-config bundled with the library. You can do so with the following shell command,
-run from your project directory:
+## Configuration
 
-```sh
-$ clj-kondo --copy-configs --dependencies --lint "$(clojure -Spath)"
-```
+Reloading a library while it is being called is by default undefined behavior (possible jvm crash). To avoid this for live REPL reloads with *multithreaded* work add "-Dcoffi.ffi.protected-downcalls=true" to the java flags. This costs about ~50% extra call time per 
+ffi call.
 
 ## Usage
 The two main namespaces are `coffi.mem` which provides functions for allocating
@@ -114,6 +92,9 @@ If your application needs to be able to run in earlier versions of the JVM than
 22, you should consider these other options.
 
 ## JVM vs Native Image Benchmarks
+Goal is to stay as fast or faster as `ae3e38a449c88b998db98b0d4bffa9908dea1c79` 
+which is the fork point from the original repo.
+
 Benchmarks comparing the identical AOT-compiled Clojure program on the JVM
 and as a GraalVM native image, both calling C through coffi, live in
 [BENCHMARKS.md](BENCHMARKS.md) — methodology, machine calibration, full
