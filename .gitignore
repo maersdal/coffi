@@ -16,3 +16,5 @@
 .hg/
 /.direnv
 *.cpcache*
+.cache
+.calva

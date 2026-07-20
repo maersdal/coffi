@@ -8,9 +8,18 @@ All notable changes to this project will be documented in this file. This change
 - Reloading of shared libraries
 - System property `coffi.ffi.protected-downcalls` which makes every downcall acquire its library's scope (~7 ns/call), so unloading or reloading a library waits for calls in flight on other threads instead of unmapping code mid-call
 - Comparison benchmark harness (`Dockerfile.compare`) which runs HEAD's benchmark code against any older ref's coffi sources side by side
+- `::coffi.mem/pointer?` nullable pointer type: serializes `nil` as NULL and deserializes NULL as `nil`; plain `::coffi.mem/pointer` now fails fast on NULL at the FFI boundary instead (inspired by dtype-next's `:pointer`/`:pointer?` distinction, thanks @cnuernber)
+- `coffi.ffi/deflibrary` for defining a whole library's fns from one data map, with per-library `:check-error` wrapping (inspired by dtype-next's `define-library`, thanks @cnuernber)
+- `coffi.clang` namespace: build struct types from `clang -Xclang -fdump-record-layouts` dumps, with every member offset verified against clang's at load time (inspired by dtype-next's `tech.v3.datatype.ffi.clang`, thanks @cnuernber)
+- clj-kondo hooks for `deflibrary`, `coffi.mem/defstruct`, and `coffi.clang/defstruct-from-layout`
+
+### Changed
+- **Breaking:** serializing `nil` or deserializing NULL as plain `::coffi.mem/pointer` now throws; use `::coffi.mem/pointer?` where NULL is legitimate
+- `coffi.mem` and `coffi.ffi` are each split across topic files (clojure.core-style `load`) to keep the sources reviewable; all vars remain in their namespaces
 
 ### Performance
 - Downcall fns created from symbol names now call through a per-symbol `MutableCallSite` linked via `invokedynamic` instead of re-resolving the symbol on every call; library loads and unloads retarget the sites (`MutableCallSite/syncAll`), so hot reloading keeps working. Per-call overhead drops from ~21 ns to ~9 ns — parity with a hand-written `static final` downcall handle. The default no longer waits for in-flight calls on unload/reload; opt back into that with `coffi.ffi.protected-downcalls` (~16 ns/call)
+- Downcall fns whose signatures are all `::coffi.mem/long`/`::coffi.mem/double` implement the matching `clojure.lang.IFn$` primitive interface, and wrapper-less `defcfn` vars for them carry prim-tagged arglists: callers compile to `invokePrim` and box neither arguments nor return values (inspired by dtype-next's typed library methods, thanks @cnuernber). The boxed fallback now coerces numbers for long/double args like the serde layer instead of requiring the exact box class
 
 ### Fixed
 - Cyclic dependency when requiring `coffi.layout` before `coffi.mem`

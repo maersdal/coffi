@@ -182,3 +182,102 @@
 (t/deftest double-pointer-serialize
   (t/is (not (zero? (is-42? 42))))
   (t/is (zero? (is-42? 41))))
+
+;;; Nullable pointer semantics (::mem/pointer fails fast, ::mem/pointer? is
+;;; nullable; distinction modeled after dtype-next's :pointer/:pointer?)
+
+(t/deftest non-nullable-pointer-return-throws-on-null
+  (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-nullable"
+                          ((ffi/cfn "get_null_ptr" [] ::mem/pointer)))))
+
+(t/deftest nullable-pointer-return-is-nil
+  (t/is (nil? ((ffi/cfn "get_null_ptr" [] ::mem/pointer?)))))
+
+(t/deftest non-nullable-pointer-arg-throws-on-nil
+  (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-nullable"
+                          ((ffi/cfn "ptr_identity" [::mem/pointer] ::mem/pointer?) nil))))
+
+(t/deftest nullable-pointer-roundtrips-nil-through-native-call
+  (t/is (nil? ((ffi/cfn "ptr_identity" [::mem/pointer?] ::mem/pointer?) nil))))
+
+(t/deftest nullable-pointer-passes-non-null-through-native-call
+  (with-open [arena (mem/confined-arena)]
+    (let [seg (mem/alloc-instance ::mem/int arena)
+          ret ((ffi/cfn "ptr_identity" [::mem/pointer?] ::mem/pointer?) seg)]
+      (t/is (= (mem/address-of seg) (mem/address-of ret))))))
+
+;;; Primitive invoke path (inspired by dtype-next's typed library methods):
+;;; wrapper-less defcfns with all-long/double signatures def the raw
+;;; downcall class, which implements the matching clojure.lang.IFn$
+;;; interface, and the var carries prim-tagged arglists so callers compile
+;;; to boxless invokePrim calls
+
+(defcfn add-longs "add_longs" [::mem/long ::mem/long] ::mem/long)
+(defcfn add-doubles "add_doubles" [::mem/double ::mem/double] ::mem/double)
+
+(t/deftest prim-eligible-defcfn-implements-prim-interface
+  (t/is (instance? clojure.lang.IFn$LLL add-longs))
+  (t/is (instance? clojure.lang.IFn$DDD add-doubles)))
+
+(t/deftest prim-eligible-defcfn-has-prim-tagged-arglists
+  (let [[arglist] (:arglists (meta #'add-longs))]
+    (t/is (= '[long long] (map (comp :tag meta) arglist)))
+    (t/is (= 'long (:tag (meta arglist))))))
+
+(t/deftest prim-path-calls-work
+  (t/is (= 5 (add-longs 2 3)))
+  (t/is (= 5.5 (add-doubles 2.25 3.25))))
+
+(t/deftest prim-eligible-boxed-path-still-works
+  (t/is (= 5 (apply add-longs [2 3])))
+  ;; the boxed invoke coerces numbers like the serde wrapper did, rather
+  ;; than requiring the exact box class
+  (t/is (= 5 (apply add-longs [(int 2) (short 3)])))
+  (t/is (= 5.5 (apply add-doubles [(float 2.25) 3.25]))))
+
+(t/deftest prim-ineligible-defcfn-unchanged
+  ;; pointer args keep the serde wrapper: no prim interface, plain arglists
+  (t/is (not (instance? clojure.lang.IFn$LLL is-42?))))
+
+;;; deflibrary: whole-library definitions as data (modeled after
+;;; dtype-next's define-library)
+
+(ffi/deflibrary test-lib
+  "Data-driven bindings for the test library."
+  {:lib-add {:symbol "add_longs"
+             :args [::mem/long ::mem/long]
+             :ret ::mem/long
+             :doc "Adds two longs."}
+   :failing-op {:args []
+                :ret ::mem/long
+                :check-error? true}
+   :null-getter {:symbol "get_null_ptr"
+                 :ret ::mem/pointer?}}
+  :check-error (fn [ret fn-kw]
+                 (if (and (number? ret) (neg? ret))
+                   (throw (ex-info "native call failed" {:fn fn-kw :ret ret}))
+                   ret)))
+
+(t/deftest deflibrary-defines-working-fns
+  (t/is (= 5 (lib-add 2 3)))
+  (t/is (nil? (null-getter))))
+
+(t/deftest deflibrary-kebab-names-map-to-snake-symbols
+  ;; :failing-op binds to native failing_op with no explicit :symbol; the
+  ;; check-error test below proves the call reaches the right native fn
+  (t/is (some? (resolve 'coffi.ffi-test/failing-op))))
+
+(t/deftest deflibrary-prim-path-applies
+  (t/is (instance? clojure.lang.IFn$LLL lib-add)))
+
+(t/deftest deflibrary-check-error-wraps-marked-fns
+  (let [e (try (failing-op) (catch clojure.lang.ExceptionInfo e e))]
+    (t/is (= {:fn :failing-op :ret -12} (ex-data e)))))
+
+(t/deftest deflibrary-var-holds-definitions
+  (t/is (= [::mem/long ::mem/long] (get-in test-lib [:lib-add :args])))
+  (t/is (= "Data-driven bindings for the test library."
+           (:doc (meta #'test-lib)))))
+
+(t/deftest deflibrary-docstrings-carry-through
+  (t/is (= "Adds two longs." (:doc (meta #'lib-add)))))

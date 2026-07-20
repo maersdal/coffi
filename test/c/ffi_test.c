@@ -125,3 +125,23 @@ ComplexType complexTypeTest(ComplexType a) {
 int is_42(int **arg) {
     return **arg == 42;
 }
+
+void *get_null_ptr(void) {
+    return NULL;
+}
+
+void *ptr_identity(void *p) {
+    return p;
+}
+
+long add_longs(long a, long b) {
+    return a + b;
+}
+
+double add_doubles(double a, double b) {
+    return a + b;
+}
+
+long failing_op(void) {
+    return -12;
+}

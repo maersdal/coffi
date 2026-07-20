@@ -2,6 +2,7 @@
 # coffi source tree, side by side on the JVM (Linux x64).
 #
 #   docker build -f Dockerfile.compare -t coffi-compare . --build-arg OLD_REF=ae3e38a449c88b998db98b0d4bffa9908dea1c79
+#   docker run --rm -e JAVA_TOOL_OPTIONS=-Dcoffi.ffi.protected-downcalls=true coffi-compare
 #   docker run --rm coffi-compare
 #
 # Pick the baseline with --build-arg OLD_REF=<sha-or-tag>. JVM-only: the old

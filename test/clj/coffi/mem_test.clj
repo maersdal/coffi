@@ -133,3 +133,46 @@
       (mem/serialize ::ComplexTestTypeWrapped)
       (mem/deserialize ::ComplexTestTypeWrapped)))))
 
+
+;;; Nullable pointer serdes (::mem/pointer fails fast, ::mem/pointer? is
+;;; nullable; distinction modeled after dtype-next's :pointer/:pointer?)
+
+(t/deftest serialize-nil-non-nullable-pointer-throws
+  (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-nullable"
+                          (mem/serialize nil ::mem/pointer))))
+
+(t/deftest serialize-nil-nullable-pointer-is-null
+  (t/is (mem/null? (mem/serialize nil ::mem/pointer?))))
+
+(t/deftest deserialize-null-non-nullable-pointer-throws
+  (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-nullable"
+                          (mem/deserialize mem/null ::mem/pointer))))
+
+(t/deftest deserialize-null-nullable-pointer-is-nil
+  (t/is (nil? (mem/deserialize mem/null ::mem/pointer?))))
+
+(t/deftest typed-nullable-pointer-roundtrip
+  (with-open [arena (mem/confined-arena)]
+    (t/is (= 42 (-> (mem/serialize 42 [::mem/pointer? ::mem/int] arena)
+                    (mem/deserialize [::mem/pointer? ::mem/int]))))
+    (t/is (nil? (-> (mem/serialize nil [::mem/pointer? ::mem/int] arena)
+                    (mem/deserialize [::mem/pointer? ::mem/int]))))))
+
+(t/deftest typed-non-nullable-pointer-roundtrip-still-works
+  (with-open [arena (mem/confined-arena)]
+    (t/is (= 42 (-> (mem/serialize 42 [::mem/pointer ::mem/int] arena)
+                    (mem/deserialize [::mem/pointer ::mem/int]))))))
+
+(t/deftest pointer-field-null-check-in-segments
+  (with-open [arena (mem/confined-arena)]
+    (let [seg (mem/alloc-instance ::mem/pointer arena)]
+      (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-nullable"
+                              (mem/serialize-into nil ::mem/pointer seg arena)))
+      (mem/serialize-into nil ::mem/pointer? seg arena)
+      (t/is (nil? (mem/deserialize-from seg ::mem/pointer?)))
+      ;; reading an untyped pointer field back returns the raw (possibly
+      ;; NULL) segment: the fail-fast check applies at the FFI boundary and
+      ;; on typed derefs, where a NULL cannot be legitimate
+      (t/is (mem/null? (mem/deserialize-from seg ::mem/pointer)))
+      (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-nullable"
+                              (mem/deserialize-from seg [::mem/pointer ::mem/int]))))))

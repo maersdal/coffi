@@ -107,31 +107,11 @@ addition the following libraries (among others) exist:
 - [tech.jna](https://github.com/techascent/tech.jna)
 - [clojure-jna](https://github.com/Chouser/clojure-jna)
 
-Dtype-next has support for Java versions 8-15, 17+, and GraalVM, but is focused
-strongly on array-based programming, as well as being focused on keeping memory
-in the native side rather than marshaling data to and from Clojure-native
-structures. In Java 17+, this uses the Foreign Function & Memory API (a part of
-Project Panama until stabilization in JDK 22), while in other Java versions it
-uses JNA.
-
-Tech.jna and clojure-jna both use the JNA library in all cases, and neither
-provide explicit support for callbacks. JNA allows the use of
-`java.nio.ByteBuffer`s to pass structs by value, and both libraries provide ways
-to use this by-value construction to call by-reference apis.
-
 An additional alternative to coffi is to directly use the JNI, which is the
-longest-standing method of wrapping native code in the JVM, but comes with the
-downside that it requires you to write both native and Java code to use, even if
-you only intend to use it from Clojure.
+longest-standing method of wrapping native code in the JVM, but it requires you to write both native and Java code.
 
 If your application needs to be able to run in earlier versions of the JVM than
-22, you should consider these other options. Dtype-next provides the most robust
-support for native code, but if you are wrapping a simple library then the other
-libraries may be more appealing, as they have a smaller API surface area and
-it's easier to wrap functions.
-
-There is also a [third party round up](https://docs.google.com/spreadsheets/d/1ViLHNUgrO2osh2AH0h7MaCaXz8g0UpLbyWojY5f10kk/edit?gid=332155605#gid=332155605)
-of FFI options for Clojure.
+22, you should consider these other options.
 
 ## JVM vs Native Image Benchmarks
 Benchmarks comparing the identical AOT-compiled Clojure program on the JVM
@@ -145,14 +125,6 @@ with coffi's eager downcall handles, native per-call cost drops ~9.5x to
 ~420 ns — ~8x faster than the jextract pattern, whose bound handles
 cannot take that path.
 
-## Known Issues
-The project author is aware of these issues and plans to fix them in a future
-release:
-
-- When generating docs with codox in a library that depends on coffi, the below error will be produced. A temporary workaround is to add an explicit dependency in your codox build on insn at version 0.2.1
-  ```
-  Unable to find static field: ACC_OPEN in interface org.objectweb.asm.Opcodes
-  ```
 
 ## Future Plans
 These features are planned for future releases.
@@ -165,7 +137,6 @@ These features are planned for future releases.
 - Improve error messages from defcfn macro
 - Mapped memory
 - Helper macros for custom serde implementations for more composite data types
-- Support for GraalVM Native Image (once their support for FFM becomes mature)
 
 ## License
 
