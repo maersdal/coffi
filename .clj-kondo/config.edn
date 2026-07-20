@@ -1,2 +1,9 @@
 {:config-paths ["org.suskalo/coffi"]
- :linters {:clojure-lsp/unused-public-var {:level :off}}}
+ :linters {:clojure-lsp/unused-public-var {:level :off}}
+ ;; clj-kondo cannot follow clojure.core-style load/in-ns namespace splits;
+ ;; these files are parts of coffi.mem and coffi.ffi (see the load forms at
+ ;; the bottom of mem.clj and ffi.clj)
+ :output {:exclude-files ["coffi/mem/serde\\.clj"
+                          "coffi/mem/composite\\.clj"
+                          "coffi/ffi/codegen\\.clj"
+                          "coffi/ffi/wrappers\\.clj"]}}

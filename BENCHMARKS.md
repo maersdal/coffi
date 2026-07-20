@@ -314,6 +314,14 @@ Measured against the resolver design (`OLD_REF=develop`, controls flat):
 | coffi FFI call overhead | 21 ns/call | **9 ns/call** | 16 ns/call |
 | jextract-pattern control | 9 ns/call | 9 ns/call | 9 ns/call |
 
+On top of the call sites, prim-eligible signatures (all
+`::mem/long`/`::mem/double`, ≤4 args) implement `clojure.lang.IFn$`
+primitive interfaces and `defcfn` tags their arglists, so callers compile
+to `invokePrim` — no boxed args or return (dtype-next-inspired). Measured
+on a trivial `add(long,long)` A/B: 10→6 ns/call with constant args, 5→5
+with volatile-loaded args (escape analysis already eliminated boxes in
+tight loops; the win is where EA fails and on allocation rate).
+
 By default the resolved address is rebased to the global scope before
 binding, eliding the liveness check: **9 ns/call — parity with a
 hand-written `static final` downcall handle**. The assumption bought with

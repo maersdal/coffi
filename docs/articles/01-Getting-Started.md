@@ -182,11 +182,19 @@ Coffi defines a basic set of primitive types:
 - float
 - double
 - pointer
+- pointer?
 
 Each of these types maps to their C counterpart. Values of any of these
 primitive types except for `pointer` will be cast with their corresponding
 Clojure function when they are passed as arguments to native functions.
 Additionally, the `c-string` type is defined, although it is not primitive.
+
+`pointer` is non-nullable: passing `nil` or receiving NULL through it
+throws immediately, rather than the NULL surfacing later as a crash.
+Where NULL is a legitimate value — optional out-parameters, functions
+returning NULL on failure — use `pointer?`, which serializes `nil` to
+NULL and deserializes NULL to `nil`. (This distinction is modeled after
+dtype-next's `:pointer`/`:pointer?`.)
 
 ### Composite Types
 In addition, some composite types are also defined in coffi, including struct
@@ -406,3 +414,58 @@ This can be used to implement out variables often seen in native code.
     (native-fn int-ptr)
     (mem/deserialize int-ptr [::mem/pointer ::mem/int])))
 ```
+
+### Defining Whole Libraries
+
+Binding a library one `defcfn` at a time gets repetitive. `deflibrary`
+takes a single map describing every function and generates the `defcfn`s
+for you (the design is modeled after dtype-next's `define-library`):
+
+```clojure
+(ffi/deflibrary libmath
+  "Bindings to my math library."
+  {:add-longs {:args [::mem/long ::mem/long]
+               :ret ::mem/long
+               :doc "Adds two longs."}
+   :checked-op {:args [::mem/pointer]
+                :ret ::mem/int
+                :check-error? true}}
+  :check-error (fn [ret fn-kw]
+                 (if (neg? ret)
+                   (throw (ex-info "call failed" {:fn fn-kw :code ret}))
+                   ret)))
+
+(add-longs 2 3) ;; => 5
+```
+
+Each entry generates a var named by the key; the native symbol defaults to
+the key with dashes replaced by underscores (`:add-longs` → `"add_longs"`),
+overridable with `:symbol`. Entries marked `:check-error? true` have their
+calls wrapped by the library's `:check-error` fn — one place to encode a
+library's error discipline instead of a wrapper body per function. The
+`libmath` var itself holds the definition map, so bindings stay diffable
+data. Everything that applies to a single `defcfn` — serialization, hot
+reload, the primitive no-boxing call path — applies unchanged.
+
+### Generating Structs from Clang
+
+For libraries with big structs, transcribing field offsets by hand is
+error-prone. The `coffi.clang` namespace parses the record layouts the C
+compiler actually uses (also modeled after dtype-next):
+
+```console
+clang mylib.c -I... -Xclang -fdump-record-layouts > layouts.txt
+```
+
+```clojure
+(require '[coffi.clang :as clang])
+
+(clang/defstruct-from-layout Packet
+  "     0 |   AVBufferRef * buf
+        8 |   int64_t pts
+       16 |   int64_t dts")
+```
+
+Every member offset is verified against clang's dump when the namespace
+loads, so a padding or alignment disagreement fails immediately instead of
+corrupting memory at call time.

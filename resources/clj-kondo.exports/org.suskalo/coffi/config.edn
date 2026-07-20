@@ -1,2 +1,5 @@
-{:hooks {:analyze-call {coffi.ffi/defcfn hooks.coffi/defcfn}}
+{:hooks {:analyze-call {coffi.ffi/defcfn hooks.coffi/defcfn
+                        coffi.ffi/deflibrary hooks.coffi/deflibrary
+                        coffi.mem/defstruct hooks.coffi/defstruct
+                        coffi.clang/defstruct-from-layout hooks.coffi/defstruct-from-layout}}
  :linters {:coffi.ffi/invalid-syntax {:level :error}}}
