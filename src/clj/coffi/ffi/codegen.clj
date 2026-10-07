@@ -397,14 +397,14 @@
   "Memoized [[deferred-downcall-class-ctor*]]."
   (memoize deferred-downcall-class-ctor*))
 
-(def ^:private indy-callsites
-  "The [[MutableCallSite]] of every [[callsite-downcall-fn*]]-generated
-  class, keyed by the boxed `Integer` id embedded in the class's
-  `invokedynamic` instruction; read by [[callsite-for-id]] when the JVM
-  links the instruction."
+;; The [[MutableCallSite]] of every [[callsite-downcall-fn*]]-generated
+;; class, keyed by the boxed `Integer` id embedded in the class's
+;; `invokedynamic` instruction; read by [[callsite-for-id]] when the JVM
+;; links the instruction.
+(defonce ^:private indy-callsites
   (ConcurrentHashMap.))
 
-(def ^:private indy-callsite-ids
+(defonce ^:private indy-callsite-ids
   (java.util.concurrent.atomic.AtomicInteger.))
 
 (defn- callsite-for-id

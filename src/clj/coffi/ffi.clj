@@ -62,27 +62,27 @@
   "Lookup for symbols in the standard system libraries, e.g. libc."
   (delay (.or (.defaultLookup (Linker/nativeLinker)) (SymbolLookup/loaderLookup))))
 
-(def ^:private libraries
-  "Registry of loaded libraries.
+;; Registry of loaded libraries.
 
-  Maps a library key (the canonical file path for [[load-library]], the
-  platform library filename for [[load-system-library]]) to a map of
-  `:arena`, `:lookup`, and `:content-hash`. Iteration order is load order,
-  which is also symbol resolution order. All access must hold the lock on
-  this object."
+;; Maps a library key (the canonical file path for [[load-library]], the
+;; platform library filename for [[load-system-library]]) to a map of
+;; `:arena`, `:lookup`, and `:content-hash`. Iteration order is load order,
+;; which is also symbol resolution order. All access must hold the lock on
+;; this object.
+(defonce ^:private libraries
   (LinkedHashMap.))
 
-(def ^:private symbol-cache
-  "Cache of resolved symbol addresses, so that repeated resolution — e.g. by
-  the native-image call path, which re-resolves on every call — is just a
-  map lookup. Invalidated whenever a library is loaded or unloaded."
+;; Cache of resolved symbol addresses, so that repeated resolution — e.g. by
+;; the native-image call path, which re-resolves on every call — is just a
+;; map lookup. Invalidated whenever a library is loaded or unloaded.
+(defonce ^:private symbol-cache
   (ConcurrentHashMap.))
 
-(def ^:private downcall-sites
-  "Registry of `[site fallback]` pairs, one per reload-aware downcall
-  [[MutableCallSite]], so library loads and unloads can retarget every site
-  back to its resolving fallback. All access must hold the lock
-  on [[libraries]]."
+;; Registry of `[site fallback]` pairs, one per reload-aware downcall
+;; [[MutableCallSite]], so library loads and unloads can retarget every site
+;; back to its resolving fallback. All access must hold the lock
+;; on [[libraries]].
+(defonce ^:private downcall-sites
   (java.util.ArrayList.))
 
 (defn- reset-downcall-sites!
