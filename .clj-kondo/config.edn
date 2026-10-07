@@ -1,4 +1,4 @@
-{:config-paths ["org.suskalo/coffi"]
+{:config-paths ["io.github.maersdal/coffi"]
  :linters {:clojure-lsp/unused-public-var {:level :off}}
  ;; clj-kondo cannot follow clojure.core-style load/in-ns namespace splits;
  ;; these files are parts of coffi.mem and coffi.ffi (see the load forms at
