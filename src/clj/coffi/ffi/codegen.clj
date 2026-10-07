@@ -486,26 +486,33 @@
   (see [[link-downcall-site!]])."
   [sym-name args ret]
   (let [fdesc (function-descriptor args ret)
-        ;; created only for its type — the bound handle's, sans the leading
-        ;; address parameter — so linking can be deferred past construction
-        unbound ^MethodHandle (unbound-downcall-handle fdesc)
-        type (.dropParameterTypes (.type unbound) 0 1)
-        site (MutableCallSite. ^MethodType type)
-        slow (fn link-and-call [args-arr]
-               (link-downcall-site! site fdesc sym-name args-arr))
-        fallback (-> (.findVirtual (MethodHandles/lookup) IFn "invoke"
-                                   (MethodType/genericMethodType 1))
-                     (.bindTo slow)
-                     (.asCollector (class (object-array 0)) (.parameterCount type))
-                     (.asType type))
-        id (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger
-                             indy-callsite-ids)]
-    (.setTarget site fallback)
-    ;; registered before the class can execute its invokedynamic, whose
-    ;; bootstrap looks the site up by id
-    (.put ^ConcurrentHashMap indy-callsites (Integer/valueOf id) site)
-    (locking libraries
-      (.add ^java.util.ArrayList downcall-sites [site fallback]))
+        ;; re-creating the same downcall swaps in place: reuse its site
+        [^MutableCallSite site _ id]
+        (locking libraries
+          (or (.get ^java.util.HashMap downcall-sites [sym-name fdesc])
+              (let [;; created only for its type — the bound handle's, sans
+                    ;; the leading address parameter — so linking can be
+                    ;; deferred past construction
+                    unbound ^MethodHandle (unbound-downcall-handle fdesc)
+                    type (.dropParameterTypes (.type unbound) 0 1)
+                    site (MutableCallSite. ^MethodType type)
+                    slow (fn link-and-call [args-arr]
+                           (link-downcall-site! site fdesc sym-name args-arr))
+                    fallback (-> (.findVirtual (MethodHandles/lookup) IFn "invoke"
+                                               (MethodType/genericMethodType 1))
+                                 (.bindTo slow)
+                                 (.asCollector (class (object-array 0))
+                                               (.parameterCount type))
+                                 (.asType type))
+                    id (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger
+                                         indy-callsite-ids)
+                    entry [site fallback id]]
+                (.setTarget site fallback)
+                ;; registered before any class can execute its invokedynamic,
+                ;; whose bootstrap looks the site up by this stable id
+                (.put ^ConcurrentHashMap indy-callsites (Integer/valueOf id) site)
+                (.put ^java.util.HashMap downcall-sites [sym-name fdesc] entry)
+                entry)))]
     (let [prim-iface (prim-sig args ret)
           boot [:invokestatic @indy-bootstrap-class "bootstrap"
                 [MethodHandles$Lookup String MethodType :int CallSite]]
@@ -542,7 +549,7 @@
                                            (insn-layout ret))
                                    (not (mem/primitive-type ret)) (cons SegmentAllocator))
                                  boot
-                                 [(Integer/valueOf id)]]
+                                 [(Integer/valueOf (int id))]]
                                 (to-object-asm ret)
                                 [:areturn]]}]
                      ;; a second invokedynamic against the same bootstrap id:
@@ -556,7 +563,7 @@
                                     (conj (mapv insn-layout args)
                                           (insn-layout ret))
                                     boot
-                                    [(Integer/valueOf id)]]
+                                    [(Integer/valueOf (int id))]]
                                    (prim-return-asm ret)]}))})]
       (.newInstance (.getConstructor ^Class klass (make-array Class 0))
                     (object-array 0)))))

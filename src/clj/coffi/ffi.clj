@@ -79,11 +79,13 @@
   (ConcurrentHashMap.))
 
 ;; Registry of `[site fallback]` pairs, one per reload-aware downcall
-;; [[MutableCallSite]], so library loads and unloads can retarget every site
-;; back to its resolving fallback. All access must hold the lock
-;; on [[libraries]].
+;; [[MutableCallSite]], keyed by `[sym-name function-descriptor]` so
+;; re-creating a downcall (e.g. a re-evaluated defcfn) swaps in place and
+;; reuses its site instead of accumulating. Library loads and unloads
+;; retarget every site back to its resolving fallback. All access must hold
+;; the lock on [[libraries]].
 (defonce ^:private downcall-sites
-  (java.util.ArrayList.))
+  (java.util.HashMap.))
 
 (defn- reset-downcall-sites!
   "Retargets every registered downcall call site back to its resolving
@@ -91,11 +93,11 @@
   each site re-resolves its symbol. Must be called while holding the lock
   on [[libraries]], whenever a library is loaded or unloaded."
   []
-  (let [n (.size ^java.util.ArrayList downcall-sites)
-        sites ^"[Ljava.lang.invoke.MutableCallSite;" (make-array MutableCallSite n)]
-    (dotimes [i n]
-      (let [[^MutableCallSite site ^MethodHandle fallback]
-            (.get ^java.util.ArrayList downcall-sites i)]
+  (let [pairs (vec (.values ^java.util.HashMap downcall-sites))
+        sites ^"[Ljava.lang.invoke.MutableCallSite;"
+        (make-array MutableCallSite (count pairs))]
+    (dotimes [i (count pairs)]
+      (let [[^MutableCallSite site ^MethodHandle fallback] (nth pairs i)]
         (.setTarget site fallback)
         (aset sites i site)))
     (MutableCallSite/syncAll sites))
